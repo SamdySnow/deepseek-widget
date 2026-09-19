@@ -1,0 +1,8 @@
+# 忽略构建与打包产物
+.build/
+dist/
+render-out/
+
+# 系统 / 编辑器
+.DS_Store
+.vscode/
