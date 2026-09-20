@@ -62,16 +62,42 @@ enum EventRouting {
         case bubble
         /// 透明像素：不接收事件
         case transparent
+        /// 已锁定：**整块面板**都不接收事件（连角色本体也穿透）
+        case locked
     }
+
+    /// 一个区域的完整事件语义。
+    ///
+    /// 把「是否接收事件」和「命中测试是否放行」拆成两个独立标志 —— 锁定态下
+    /// 二者**不一致**：既要穿透（`acceptsEvents = false`），
+    /// 又必须让 `hitTest` 返回 nil（`hitTestable = false`），
+    /// 否则光标落在角色本体上时会交给容器，容器随后照常推进气泡序列。
+    ///
+    /// 之前只有一个 `acceptsEvents` 函数，锁定态就没法表达这种差异。
+    struct Behavior: Equatable {
+        var acceptsEvents: Bool
+        var hitTestable: Bool
+        /// 是否允许拖动窗口（锁定后彻底不动）
+        var draggable: Bool
+        /// 是否允许推进气泡序列
+        var advancesBubble: Bool
+    }
+
+    /// 锁定态下**所有**区域共享的行为：完全惰性，一切交互关闭。
+    static let lockedBehavior = Behavior(acceptsEvents: false, hitTestable: false,
+                                         draggable: false, advancesBubble: false)
 
     /// 判断归一化面板坐标（原点左上）落在哪个区域。
     ///
-    /// 优先级：菜单按钮 > 角色本体 > 气泡 > 透明。
-    /// 菜单按钮叠在角色本体上，必须先判，否则点按钮会被当成点本体。
+    /// 优先级：锁定 > 菜单按钮 > 角色本体 > 气泡 > 透明。
+    /// 锁定排在最前，因为它使其它一切判定失去意义。
+    /// 菜单按钮叠在角色本体上，必须先于角色本体判，否则点按钮会被当成点本体。
     static func zone(at point: CGPoint,
                      hitMask: HitMask?,
                      panelSide: CGFloat,
-                     menuButtonRect: CGRect?) -> Zone {
+                     menuButtonRect: CGRect?,
+                     locked: Bool = false) -> Zone {
+        if locked { return .locked }
         if let menuButtonRect, menuButtonRect.contains(point) { return .menuButton }
         // 遮罩只含角色本体像素
         if let hitMask, hitMask.contains(x: point.x * panelSide,
@@ -83,12 +109,29 @@ enum EventRouting {
         return .transparent
     }
 
-    /// 该区域是否需要本窗口接收鼠标事件。
-    /// 只有角色本体与菜单按钮需要；气泡与透明像素一律穿透。
-    static func acceptsEvents(_ zone: Zone) -> Bool {
+    /// 区域 → 事件语义。
+    ///
+    /// 只有角色本体与菜单按钮参与交互；气泡与透明像素一律穿透。
+    /// 锁定态下没有任何区域参与交互（含角色本体与菜单按钮）。
+    static func behavior(_ zone: Zone) -> Behavior {
         switch zone {
-        case .character, .menuButton: return true
-        case .bubble, .transparent: return false
+        case .locked:
+            return lockedBehavior
+        case .character:
+            return Behavior(acceptsEvents: true, hitTestable: true,
+                            draggable: true, advancesBubble: true)
+        case .menuButton:
+            // 菜单按钮自己不推进气泡序列 —— 那一下交给 SwiftUI；
+            // 若容器也去推进，就会出现「点菜单按钮，气泡跟着跳一格」。
+            return Behavior(acceptsEvents: true, hitTestable: true,
+                            draggable: false, advancesBubble: false)
+        case .bubble, .transparent:
+            return Behavior(acceptsEvents: false, hitTestable: false,
+                            draggable: false, advancesBubble: false)
         }
     }
+
+    /// 该区域是否需要本窗口接收鼠标事件。
+    /// 只有角色本体与菜单按钮需要；气泡、透明像素与锁定态一律穿透。
+    static func acceptsEvents(_ zone: Zone) -> Bool { behavior(zone).acceptsEvents }
 }

@@ -59,7 +59,9 @@ swift run WhaleWidget
 | **点击 ☰ 按钮** | 弹出菜单（大小 / 音效 / 提醒 / 密钥 / 各设置窗口） |
 | **拖动小鲸鱼** | 移动挂件；松手靠近屏幕边缘时自动吸附 |
 | **右键小鲸鱼** | 唤出菜单（菜单按钮被禁用时的备用入口） |
-| **菜单栏 🐋 图标** | 显示/隐藏挂件、立即刷新、设置、退出 |
+| **锁定** | 整个挂件不再响应鼠标（点击穿透到桌面）；解锁走菜单栏 🐋 → 「解锁挂件」 |
+| **不透明度** | 菜单里的滑块，20%–100% 实时生效，不影响可点击性 |
+| **菜单栏 🐋 图标** | 显示/隐藏挂件、立即刷新、解锁挂件、设置、退出 |
 
 > **可交互区域 = 只有小鲸鱼本体**：命中判定按角色图的 alpha 通道逐像素烘焙，
 > 所以既不是规则矩形，也不包含气泡 —— 气泡是纯展示，点它不推进序列。
@@ -98,6 +100,8 @@ swift run WhaleWidget
 | 每轮消耗泡泡 | ✅ | `{cost}` 占位符；自动关闭秒数可设 |
 | 音效 | ✅ | 小黄鸭 / 音效1 按压松开音；任务结束音（经验球 / 预设 A） |
 | 菜单按钮可隐藏 | ✅ | 隐藏后右键小鲸鱼唤出菜单；默认常驻可见（悬停变清晰） |
+| 锁定（整块窗口穿透） | ✅ | 锁定后角色本体 / 气泡 / 菜单按钮 / 右键全部让出鼠标，点击直达下层应用；拖动与吸附一并停用；解锁只能从菜单栏 🐋 |
+| 不透明度调节 | ✅ | 菜单滑块，20%–100%；下限刻意不为 0（免得挂件「消失」无从找回）；减淡不影响点击与位置 |
 | 用量记录窗口 | ✅ | 今日模型占比、近 7 天、搜索、逐条明细 |
 | DSH 历史账本导入 | ✅ | 首次运行自动导入，口径与 DSH 连续 |
 | 多厂商自定义 API | ❌ | 桌面版聚焦 DeepSeek 内置余额，未移植 34 个厂商模板 |
@@ -222,7 +226,7 @@ Scripts/
 - **click-through**：只让 `hitTest` 返回 `nil` **不等于**穿透 —— 事件仍落在本窗口上，
   只是没人处理，下层窗口收不到。真正的穿透靠按光标位置切换
   `window.ignoresMouseEvents`：`EventRouting.zone(at:)` 把位置分成
-  `character` / `menuButton` / `bubble` / `transparent`，只有前两者接收事件。
+  `character` / `menuButton` / `bubble` / `transparent` / `locked`，只有前两者接收事件。
   窗口忽略鼠标事件后收不到 `mouseMoved`，因此用 `NSEvent.addGlobalMonitorForEvents`
   跟踪光标；拖动 / 按压期间跳过切换，避免跟丢。
 - **状态目录隔离**：`--selftest` / `--hitcheck` / `--e2e` / `--render` / `--stress`
@@ -245,6 +249,29 @@ Scripts/
   `BubbleRuntime.queueIndex` 曾是普通属性，`currentPage` 由它推导 →
   第 2 次点击时 `isOpen` 没变、`queueIndex` 又发不出通知，SwiftUI 收不到变更，
   界面停在旧页；第 3 次点击 `isOpen` 翻 false 才重绘并顺势收起（看起来像「消失」）。
+- **锁定**：新增 `EventRouting.Zone.locked`，整块面板一律 `ignoresMouseEvents`。
+  两个容易踩的点：
+  1. **「不接收事件」与「命中测试放行」是两件事。** 锁定后不仅要穿透，
+     还必须让 `hitTest` 返回 `nil` —— 否则光标落在角色本体上时事件仍会交给容器，
+     容器照常推进气泡序列，锁定形同虚设。因此把它拆成
+     `EventRouting.Behavior { acceptsEvents, hitTestable, draggable, advancesBubble }`，
+     而不是继续用一个 `acceptsEvents` 布尔（那样表达不了这种差异）。
+  2. **判断顺序**：`updateEventAcceptance` 里锁定必须写在「快路径」**之前** ——
+     那条快路径只在光标离开窗口时才置 `ignoresMouseEvents`，光标停在角色本体上时
+     它什么都不做，锁定会失效。
+  另外：锁定期间会临时把 `snapEnabled` 置 false（解锁时还原），
+  否则窗口可能被吸附推走，与「锁定 = 纹丝不动」矛盾；
+  解锁入口必须在菜单栏（挂件自身已不可交互），并带锁定角标作为可见反馈。
+- **不透明度**：挂在 `WhalePanelView` 的 `.opacity(store.config.panelOpacity)` 上，
+  即**视图层**。不要改用 `NSWindow.alphaValue`：与视图层叠加会相乘
+  （滑到 0.5 变成 0.25），而且 `--render` 离屏渲染读不到 `NSWindow` 属性，
+  等于失去测试覆盖。选择这条路径后，不透明度就能用「渲染像素的最大 alpha」来断言。
+- **配置向后兼容**：`locked` / `opacity` 写成 **Optional（默认 nil）**，不是笔误 ——
+  Swift 合成的 `init(from:)` **不会**用属性默认值兜住缺失的键，
+  写成非 Optional 的话，旧版本写出的 `config.json`（没有这两个键）会抛
+  `keyNotFound` → `load()` 返回 `nil` → 用户的缩放 / 位置 / 开关被静默重置。
+  `--hitcheck` 里有回归断言，并且额外钉了一条**对照断言**
+  （同键的非 Optional 版本必须解码失败），免得日后被「顺手简化」掉。
 
 ## 已知限制
 

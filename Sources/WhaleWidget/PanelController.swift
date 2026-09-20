@@ -21,6 +21,9 @@ final class PanelController {
     private var acceptsEventsNow = true
     /// 当前是否处于「按下」状态（拖动 / 点击期间必须持续接收事件）
     private var isPressing = false
+    /// 锁定期间是否已暂停自动吸附，以及暂停前的用户设置（解除锁定时还原）
+    private var snapSuspendedByLock = false
+    private var lastSnapEnabledBeforeLock = true
     private let sounds = SoundPlayer()
 
     init(store: WhaleStore, bubble: BubbleRuntime) {
@@ -30,6 +33,8 @@ final class PanelController {
         wireCallbacks()
         restorePosition()
         observeScreenChanges()
+        // 启动时若配置是「已锁定」，立刻进入穿透 + 暂停吸附状态
+        applyInteractionState()
 
         bubble.refreshResolved(page: bubble.currentPage)
     }
@@ -129,6 +134,15 @@ final class PanelController {
     /// 面板边长（供自检计算取样点）
     var panelSideLength: CGFloat { window.frame.width }
 
+    /// 窗口当前是否忽略鼠标事件（供自检断言「锁定 = 真穿透」）。
+    var windowIgnoresMouseEvents: Bool { window.ignoresMouseEvents }
+
+    /// 窗口当前原点（供自检断言「锁定后拖不动」）。
+    var windowFrameOrigin: NSPoint { window.frame.origin }
+
+    /// 视图承载层的不透明度（供自检断言）。
+    var hostingAlpha: CGFloat { hosting.alphaValue }
+
     /// 把面板移到屏幕外，避免自检时窗口闪现在用户桌面上。
     func moveOffscreenForTesting() {
         window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
@@ -150,8 +164,40 @@ final class PanelController {
         // 按钮隐藏时置 nil：否则它周围一块会变成「可点但无反应」的死区
         container.menuButtonRect = store.config.menuButtonHidden
             ? nil : Positioning.menuButtonRectNormalized
+        container.locked = store.config.isLocked
         startMouseTracking()
         updateEventAcceptance(at: NSEvent.mouseLocation)
+    }
+
+    /// 应用锁定 / 交互开关。
+    ///
+    /// **不透明度不在这里处理**：它由 `WhalePanelView` 直接读 `store.config.panelOpacity`
+    /// 并挂 `.opacity(...)`（视图已观察 store，配置一变自动重绘）。
+    /// 若这里再设一次 `window.alphaValue`，两处会相乘 —— 滑到 0.5 会得到 0.25，
+    /// 而且离屏渲染校验（`--render`）看不到 `NSWindow` 的属性，等于失去测试覆盖。
+    func applyInteractionState() {
+        container.locked = store.config.isLocked
+        applySnapPolicy()
+        updateEventAcceptance(at: NSEvent.mouseLocation)
+    }
+
+    /// 锁定状态下要停止自动吸附。
+    ///
+    /// 理由：吸附会在窗口靠近屏幕边缘**约 24px** 时把它吸过去，而「锁定」
+    /// 恰恰常在拖到某个角落之后使用。若此时仍允许吸附，窗口可能被推到
+    /// 贴边位置，用户再解锁时就会发现挂件换了地方 —— 锁定应当保证它纹丝不动。
+    /// 解锁后恢复：位置没变，因此不会被吸走；用户再拖动时会重新吸附。
+    private func applySnapPolicy() {
+        if store.config.isLocked {
+            if !snapSuspendedByLock {
+                snapSuspendedByLock = true
+                lastSnapEnabledBeforeLock = store.config.snapEnabled
+                store.update { $0.snapEnabled = false }
+            }
+        } else if snapSuspendedByLock {
+            snapSuspendedByLock = false
+            store.update { $0.snapEnabled = lastSnapEnabledBeforeLock }
+        }
     }
 
     // MARK: - Click-through
@@ -193,6 +239,16 @@ final class PanelController {
         // 拖动 / 按压过程中必须持续接收事件，否则中途松开就跟丢了
         guard !isPressing else { return }
 
+        // **锁定态：整块窗口一律不接收事件**（含角色本体）。
+        // 这里必须先于下面的「快路径」判断 —— 那条路径只在光标离开窗口时才置
+        // ignoresMouseEvents，光标停在角色本体上时它什么都不做，锁定会失效。
+        guard !store.config.isLocked else {
+            guard acceptsEventsNow else { return }
+            acceptsEventsNow = false
+            window.ignoresMouseEvents = true
+            return
+        }
+
         // 快路径：屏幕坐标先粗判是否落在窗口附近，避免每次鼠标移动都做
         // 坐标换算 + 遮罩查表（遮罩是 450×450 的位图）。
         let frame = window.frame
@@ -208,7 +264,8 @@ final class PanelController {
         let zone = EventRouting.zone(at: panelPoint,
                                      hitMask: container.hitMask,
                                      panelSide: frame.width,
-                                     menuButtonRect: container.menuButtonRect)
+                                     menuButtonRect: container.menuButtonRect,
+                                     locked: store.config.isLocked)
         let accepts = EventRouting.acceptsEvents(zone)
         guard accepts != acceptsEventsNow else { return }
         acceptsEventsNow = accepts
@@ -368,6 +425,9 @@ final class PanelController {
                                   soundPlayer: sounds,
                                   anchorWindow: window,
                                   onScaleChange: { [weak self] in self?.applyScale() },
+                                  onInteractionChange: { [weak self] in
+                                      self?.applyInteractionState()
+                                  },
                                   onClose: {})
     }
 

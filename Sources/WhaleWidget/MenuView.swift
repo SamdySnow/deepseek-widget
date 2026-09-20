@@ -7,6 +7,8 @@ struct MenuView: View {
     @ObservedObject var bubble: BubbleRuntime
     @ObservedObject var soundPlayer: SoundPlayer
     var onScaleChange: () -> Void
+    /// 锁定 / 不透明度变化后，让控制器重新计算穿透与吸附
+    var onInteractionChange: () -> Void
     var onOpenUsage: () -> Void
     var onOpenBubbleEditor: () -> Void
     var onReconcile: () -> Void
@@ -34,6 +36,39 @@ struct MenuView: View {
                 Text(String(format: "%.1f×", store.config.scale))
                     .font(.system(size: 11, design: .monospaced))
                     .frame(width: 38, alignment: .trailing)
+            }
+
+            // 不透明度
+            row("不透明度") {
+                Slider(value: Binding(
+                    get: { store.config.panelOpacity },
+                    set: { value in
+                        store.update { $0.opacity = value }
+                        onInteractionChange()
+                    }), in: AppConfig.opacityRange)
+                Text("\(Int((store.config.panelOpacity * 100).rounded()))%")
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(width: 38, alignment: .trailing)
+            }
+
+            // 锁定
+            HStack(spacing: 6) {
+                Toggle("锁定", isOn: Binding(
+                    get: { store.config.isLocked },
+                    set: { value in
+                        store.update { $0.locked = value }
+                        onInteractionChange()
+                    }))
+                    .help("锁定后整个挂件都不响应鼠标：点击穿透到桌面，"
+                          + "拖动、气泡序列、菜单按钮、右键一并失效。"
+                          + "解锁入口只有这里和菜单栏 🐋（因为挂件本身已经点不动了）")
+                Spacer()
+                if store.config.isLocked {
+                    // 唯一找回入口必须显眼：挂件此时连右键都不响应
+                    Text("已锁定 · 用菜单栏 🐋")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                }
             }
 
             // 音效

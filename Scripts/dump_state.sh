@@ -17,10 +17,16 @@ print("\n=== config.json ===")
 p = d / "config.json"
 if p.exists():
     c = json.loads(p.read_text())
-    for k in ("scale", "lastSide", "lastX", "lastY", "snapEnabled",
+    for k in ("scale", "opacity", "locked", "lastSide", "lastX", "lastY", "snapEnabled",
               "menuButtonHidden", "bubbleOn", "turnCostOn", "peakStyle"):
         if k in c:
             print(f"  {k} = {c[k]}")
+        else:
+            # 旧配置不会有这两个键（都视为默认值）；列出来是因为
+            # 「挂件点不动 / 变淡了」十有八九就是它们被设成了非默认值。
+            print(f"  {k} = （无此键，按默认值处理："
+                  + ("未锁定" if k == "locked" else "1.0" if k == "opacity" else "—")
+                  + "）")
 else:
     print("  （不存在）")
 

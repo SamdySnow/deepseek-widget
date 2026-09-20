@@ -39,27 +39,25 @@ final class WidgetContainerView: NSView {
     /// - **菜单按钮**：交给 SwiftUI 宿主视图，让按钮自己的 `onTapGesture` 生效；
     /// - **角色本体**：返回 `self`，由容器处理拖动 / 点击（不能返回子视图，
     ///   否则事件会被 SwiftUI 吃掉，容器收不到 `mouseDown/Dragged/Up`）；
-    /// - **其余（气泡、透明角落）**：返回 nil，穿透。
+    /// - **其余（气泡、透明角落、锁定态）**：返回 nil，穿透。
+    ///
+    /// 注意锁定态取的是 `behavior.hitTestable` 而不是 `acceptsEvents`：
+    /// 两者在锁定态下**不同**（见 `EventRouting.Behavior` 的说明）。
     override func hitTest(_ point: NSPoint) -> NSView? {
         let local = convert(point, from: superview)
         guard bounds.contains(local) else { return nil }
 
-        let p = panelPoint(local: local)
-
-        // ① 菜单按钮优先：它叠在角色本体右上角，需要交给 SwiftUI 的按钮
-        if let rect = menuButtonRect, rect.contains(p) {
+        switch currentZone(at: panelPoint(local: local)) {
+        case .menuButton:
+            // 菜单按钮优先：它叠在角色本体右上角，需要交给 SwiftUI 的按钮
             return super.hitTest(point)
-        }
-
-        // ② 角色本体：容器自己处理
-        if let hitMask, hitMask.contains(x: p.x * bounds.width,
-                                         y: p.y * bounds.height,
-                                         panelSide: bounds.width) {
+        case .character:
+            // 角色本体：容器自己处理
             return self
+        case .bubble, .transparent, .locked:
+            // 气泡 / 透明像素 / 锁定态：一律穿透到桌面
+            return nil
         }
-
-        // ③ 气泡 / 透明像素：穿透到桌面
-        return nil
     }
 
     // MARK: - 悬停
@@ -86,17 +84,18 @@ final class WidgetContainerView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        // 只有真正落在「有像素」的区域才算悬停 —— 透明角落不该让菜单按钮冒出来。
+        // 只有真正落在「角色本体」上才算悬停 —— 透明角落与气泡都不该让菜单按钮冒出来。
+        // 锁定态下连角色本体也不算（整块面板都不参与交互）。
         // 推迟到下一个 runloop tick：悬停会改 @Published 状态并触发 SwiftUI 重排，
         // 在事件回调里同步改容易与 tracking area 的更新打架。
-        guard hitContains(event) else { return }
+        guard currentZone(at: panelPoint(event)) == .character else { return }
         DispatchQueue.main.async { [weak self] in self?.onMouseEnter?() }
     }
 
     override func mouseMoved(with event: NSEvent) {
-        // 命中遮罩会随气泡开合变化，需要在移动中重新判定进入 / 离开。
+        // 命中区域会随气泡开合 / 锁定变化，需要在移动中重新判定进入 / 离开。
         // （inVisibleRect 的 tracking area 只在跨越视图边界时才发 entered/exited）
-        let inside = hitContains(event)
+        let inside = currentZone(at: panelPoint(event)) == .character
         guard inside != isInsideHitArea else { return }
         isInsideHitArea = inside
         DispatchQueue.main.async { [weak self] in
@@ -116,20 +115,22 @@ final class WidgetContainerView: NSView {
     // MARK: - 指针
 
     /// 右键小鲸鱼唤出菜单（菜单按钮隐藏后的入口）。
+    /// 锁定态下连右键也要挡掉 —— 否则「锁定」并非真的不可交互。
     override func rightMouseDown(with event: NSEvent) {
+        guard !locked else {
+            super.rightMouseDown(with: event)
+            return
+        }
         DispatchQueue.main.async { [weak self] in self?.onRightClick?(event) }
     }
 
     override func mouseDown(with event: NSEvent) {
-        // 只有落在「小鲸鱼 / 气泡」的可见区域才响应，
+        // 只有落在「小鲸鱼」的可见区域才响应，
         // 方窗的透明四角不拦截桌面点击。
-        guard hitContains(event) else {
-            super.mouseDown(with: event)
-            return
-        }
-        // 菜单按钮叠在小鲸鱼右上角：这一下交给 SwiftUI 的按钮处理，
-        // 容器不要把它当成「点本体」，否则点菜单会顺带把气泡也翻一格。
-        if let menuButtonRect, menuButtonRect.contains(panelPoint(event)) {
+        // 这里查 `currentZone` 而不是命中遮罩：锁定态必须一并短路 ——
+        // 否则锁定后这一下仍会被容器接住并推进气泡序列。
+        let behavior = EventRouting.behavior(currentZone(at: panelPoint(event)))
+        guard behavior.draggable || behavior.advancesBubble else {
             super.mouseDown(with: event)
             return
         }
@@ -160,6 +161,30 @@ final class WidgetContainerView: NSView {
         movedDuringPress = false
         let kind = PointerIntent.resolve(start: start, end: p, movedDuringPress: wasDrag)
         onRelease?(kind, p)
+    }
+
+    /// 面板是否处于锁定态（整块窗口 click-through）。
+    ///
+    /// 与 `isMirrored` / `menuButtonRect` 一样由控制器写入：容器不持有 store，
+    /// 这里只保存一份判定所需的快照。
+    var locked = false
+
+    /// 判定某个面板坐标属于哪个区域。容器内所有命中判定都走这里，
+    /// 保证 `hitTest` / `mouseDown` / `mouseMoved` 三处语义完全一致。
+    private func currentZone(at point: CGPoint) -> EventRouting.Zone {
+        // 遮罩为空 = 降级模式：整块视图都算命中（仅用于测试 / 遮罩尚未烘焙时）。
+        // 这是**容器层面**的降级语义，所以放在这里而不是塞进 `EventRouting`：
+        // 真实链路里遮罩必然存在，把降级逻辑混进路由反而会掩盖问题。
+        // 注意锁定优先于降级 —— 降级不该让锁定失效。
+        if !locked, hitMask == nil {
+            if let menuButtonRect, menuButtonRect.contains(point) { return .menuButton }
+            return .character
+        }
+        return EventRouting.zone(at: point,
+                                 hitMask: hitMask,
+                                 panelSide: bounds.width,
+                                 menuButtonRect: menuButtonRect,
+                                 locked: locked)
     }
 
     /// 取事件发生时的屏幕坐标。
@@ -203,14 +228,6 @@ final class WidgetContainerView: NSView {
         guard let win = window else { return nil }
         let inWindow = win.convertPoint(fromScreen: screen)
         return panelPoint(local: convert(inWindow, from: nil))
-    }
-
-    private func hitContains(_ event: NSEvent) -> Bool {
-        guard let hitMask else { return true }
-        let p = panelPoint(event)
-        return hitMask.contains(x: p.x * bounds.width,
-                               y: p.y * bounds.height,
-                               panelSide: bounds.width)
     }
 
     /// 视图尺寸变化后需要重新计算 tracking area。

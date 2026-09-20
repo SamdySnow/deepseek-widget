@@ -56,13 +56,14 @@ struct WhaleWidgetApp {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var panel: PanelController?
     private let store = WhaleStore()
     private let bubble = BubbleRuntime()
     private var statusItem: NSStatusItem?
     private var settingsWindow: NSWindow?
+    private var unlockItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 先在菜单栏放一个入口，方便在挂件被隐藏时找回
@@ -91,25 +92,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "显示 / 隐藏挂件", action: #selector(togglePanel), keyEquivalent: "h")
         menu.addItem(withTitle: "立即刷新余额", action: #selector(refresh), keyEquivalent: "r")
         menu.addItem(.separator())
+        // 锁定的**唯一**解锁入口：锁定后整个挂件 click-through，
+        // 连菜单按钮与右键都不再响应，用户只能从这里回来。
+        let unlock = NSMenuItem(title: "解锁挂件",
+                                action: #selector(unlockPanel), keyEquivalent: "l")
+        menu.addItem(unlock)
+        unlockItem = unlock
+        menu.addItem(.separator())
         menu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(.separator())
         menu.addItem(withTitle: "退出", action: #selector(quit), keyEquivalent: "q")
         for menuItem in menu.items { menuItem.target = self }
         item.menu = menu
         statusItem = item
+        // 菜单每次弹出前刷新「解锁挂件」的可用状态（未锁定时置灰）
+        menu.delegate = self
     }
 
     @objc private func togglePanel() { panel?.toggleVisibility() }
 
     @objc private func refresh() { Task { await store.refresh() } }
 
+    /// 解除锁定。锁定时挂件本身不可交互，因此这个入口必须在菜单栏可用。
+    @objc private func unlockPanel() {
+        guard store.config.isLocked else { return }
+        store.update { $0.locked = false }
+        panel?.applyInteractionState()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     @objc private func quit() { NSApp.terminate(nil) }
+
+    /// 菜单弹出前刷新「解锁挂件」的状态：未锁定时置灰，避免出现「点了没反应」。
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        unlockItem?.isEnabled = store.config.isLocked
+    }
 
     @objc private func openSettings() {
         settingsWindow?.close()
         let hosting = NSHostingView(rootView: SettingsView(store: store, bubble: bubble,
                                                            onScaleChange: { [weak self] in
             self?.panel?.applyScale()
+        }, onInteractionChange: { [weak self] in
+            self?.panel?.applyInteractionState()
         }))
         let size = NSSize(width: 380, height: 520)
         hosting.frame = NSRect(origin: .zero, size: size)
@@ -133,6 +158,7 @@ struct SettingsView: View {
     @ObservedObject var store: WhaleStore
     @ObservedObject var bubble: BubbleRuntime
     var onScaleChange: () -> Void
+    var onInteractionChange: () -> Void
 
     var body: some View {
         ScrollView {
@@ -140,6 +166,7 @@ struct SettingsView: View {
                      bubble: bubble,
                      soundPlayer: SoundPlayer(),
                      onScaleChange: onScaleChange,
+                     onInteractionChange: onInteractionChange,
                      onOpenUsage: {
                          WindowPresenter.shared.show(title: "用量记录",
                                                      size: NSSize(width: 460, height: 560)) {

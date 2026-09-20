@@ -16,6 +16,21 @@ struct AppConfig: Codable {
     var turnCostCloseMs: Int = 5000
     var menuButtonHidden: Bool = false
 
+    // 交互（锁定 / 不透明度）
+    //
+    // 这两个字段是 **Optional 且默认 nil**，这是有意为之，不是笔误：
+    // Swift 合成的 `init(from:)` **不会**用属性默认值兜住缺失的键，
+    // 旧配置文件（没有这个键）会直接抛 keyNotFound → `AppConfig.load()` 返回 nil
+    // → 用户的缩放 / 位置 / 开关被静默重置。
+    // 写成 Optional 就能走 `decodeIfPresent`，旧配置照常解码。
+    // （`SelfTest` 里有针对这一点的回归测试。）
+
+    /// 锁定挂件：整个窗口 click-through，连角色本体也不接收鼠标事件。
+    /// 唯一解除入口是菜单栏 🐋（因为挂件本身已经点不动了）。nil = 未锁定。
+    var locked: Bool?
+    /// 挂件不透明度（`AppConfig.opacityRange` 内）。nil = 1.0（完全不透明）。
+    var opacity: Double?
+
     // 提醒
     /// 余额低于该值时提醒（nil = 关闭）
     var balanceAlert: Double?
@@ -37,6 +52,26 @@ struct AppConfig: Codable {
     var refreshInterval: Double = 60
 
     var updatedAt: String = ""
+
+    // MARK: - 派生状态
+
+    /// 不透明度的可调范围。
+    ///
+    /// 下限**不为 0**：完全透明会让挂件「消失」，而用户又不一定记得
+    /// 菜单里有这个滑块 —— 那就变成了「挂件不见了」的求助场景。
+    /// 0.2 足够淡，但仍能看见并拖回来。
+    static let opacityRange: ClosedRange<Double> = 0.2...1.0
+
+    /// 是否处于锁定状态（缺失键 → 未锁定）。
+    var isLocked: Bool { locked ?? false }
+
+    /// 归一化后的不透明度：越界值夹回范围，非有限值（NaN / ±inf）取 1.0。
+    ///
+    /// 手改配置写成 5.0 之类不应让窗口变得不可见，因此这里必须夹取。
+    var panelOpacity: Double {
+        guard let opacity, opacity.isFinite else { return 1.0 }
+        return min(max(opacity, Self.opacityRange.lowerBound), Self.opacityRange.upperBound)
+    }
 
     // MARK: - 读写
 

@@ -38,16 +38,42 @@ struct WhalePanelView: View {
                                value: store.balance)
 
                 // 菜单按钮：与拖拽层平级、最后绘制 → 命中优先
-                if !store.config.menuButtonHidden {
+                if !store.config.menuButtonHidden && !store.config.isLocked {
                     menuButton(width: width)
                 }
+
+                // 锁定角标：整块面板已经点不动了，必须给出可见反馈，
+                // 否则用户会以为挂件坏了（「点了没反应」）。
+                if store.config.isLocked {
+                    lockBadge(width: width)
+                }
             }
+            // 不透明度挂在内层：`.scaleEffect` 的镜像会作用到**它绘制出来的结果**上，
+            // 与在外层挂 opacity 视觉等价，但内层还能让 opacity 的动画值
+            // 与镜像动画互不干扰（同一个 modifier 链上重复挂会有覆盖风险）。
+            .opacity(store.config.panelOpacity)
         }
         .frame(width: panelSide, height: panelSide)
         // 贴左吸附时整体水平镜像（文字同步反向）
         .scaleEffect(x: store.config.lastSide == "left" && store.config.mirrorOnLeftSnap ? -1 : 1,
                      y: 1, anchor: .center)
         .animation(.easeInOut(duration: 0.3), value: store.config.lastSide)
+        .animation(.easeInOut(duration: 0.12), value: store.config.panelOpacity)
+    }
+
+    /// 锁定状态角标：右上角一把小锁。
+    private func lockBadge(width: CGFloat) -> some View {
+        let side = width * 26 / 320
+        return Image(systemName: "lock.fill")
+            .font(.system(size: side * 0.6))
+            .foregroundColor(.white)
+            .frame(width: side, height: side)
+            .background(
+                RoundedRectangle(cornerRadius: side * 0.23)
+                    .fill(Color(red: 0.125, green: 0.192, blue: 0.439).opacity(0.9))
+            )
+            .position(x: width - side / 2 - width * 0.0125,
+                      y: width * 0.4055 + side * 0.6)
     }
 
     /// 小鲸鱼所在矩形（右下 59.45%）。

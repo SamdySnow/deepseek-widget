@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SwiftUI
 
 /// 端到端自检：起真实窗口 + 真实控制器，用合成鼠标事件走完整链路。
 ///
@@ -51,6 +52,39 @@ enum EndToEndCheck {
             container.mouseUp(with: up)
             // 让动画 / asyncAfter / SwiftUI 更新都跑完，等价于两次真人点击的间隔
             pump(0.35)
+        }
+
+        /// 把当前挂件离屏渲染一遍，返回像素的最大 alpha。
+        ///
+        /// 之所以要**渲染像素**而不只读配置：不透明度的效果必须落在用户真正看到的
+        /// 那层画面上。若把 opacity 挂错层级（例如挂在被后续 modifier 覆盖掉的位置），
+        /// 配置值会是对的、渲染结果却不变 —— 只查配置就抓不到。
+        func alphaSampler(_ opacity: Double) -> (maxAlpha: Double, meanAlpha: Double) {
+            let view = WhalePanelView(store: store, bubble: bubble,
+                                      interaction: PanelInteraction(),
+                                      onMenu: {})
+                .frame(width: panel, height: panel)
+            let renderer = ImageRenderer(content: view)
+            renderer.scale = 1
+            renderer.isOpaque = false
+            guard let image = renderer.nsImage,
+                  let tiff = image.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff) else {
+                return (0, 0)
+            }
+            var maxAlpha = 0.0
+            var sum = 0.0
+            var count = 0
+            for y in stride(from: 0, to: rep.pixelsHigh, by: 3) {
+                for x in stride(from: 0, to: rep.pixelsWide, by: 3) {
+                    guard let c = rep.colorAt(x: x, y: y) else { continue }
+                    let a = Double(c.alphaComponent)
+                    maxAlpha = Swift.max(maxAlpha, a)
+                    sum += a
+                    count += 1
+                }
+            }
+            return (maxAlpha, count > 0 ? sum / Double(count) : 0)
         }
 
         /// 小鲸鱼身体上一个「肯定有像素」的点（面板坐标，原点左上）。
@@ -201,6 +235,88 @@ enum EndToEndCheck {
                 : "\(deadPoints.count)/\(sampled) 点无响应，例如 "
                   + String(format: "(%.1f, %.1f)", deadPoints[0].x, deadPoints[0].y))
         bubble.close()
+
+        print("== 端到端：锁定后整块窗口 click-through ==")
+        // 锁定的关键是**真的穿透**，而不只是「没人处理事件」。
+        // 二者差别就在 `window.ignoresMouseEvents`：只让 hitTest 返回 nil 时，
+        // 事件仍然落在本窗口上，下层应用收不到。
+        bubble.close()
+        store.update { $0.locked = true }
+        controller.applyInteractionState()
+        pump(0.15)
+
+        check("锁定后窗口忽略鼠标事件（真穿透，非仅不处理）",
+              controller.windowIgnoresMouseEvents,
+              "ignoresMouseEvents=\(controller.windowIgnoresMouseEvents)")
+
+        // 锁定后点角色本体：既不能出泡，也不能拖动窗口。
+        // 这里仍然调用容器的原生事件（而不是只查配置）：要验的是**接线**，
+        // 即容器自己是否也认定这一下无效。
+        let lockFrameBefore = controller.windowFrameOrigin
+        click(at: bodyView)
+        check("锁定后点角色本体不展开气泡", !bubble.isOpen,
+              bubble.isOpen ? "❌ 仍然出泡了（hitTest 没放行）" : "保持收起")
+        click(at: bodyView, dragTo: NSPoint(x: bodyView.x - 50, y: bodyView.y - 40))
+        check("锁定后无法拖动窗口", controller.windowFrameOrigin == lockFrameBefore)
+
+        // 锁定后右键也不该唤出菜单 —— 否则「锁定」并非真的不可交互。
+        // 这里用一个独立容器计数（不改动真实容器的回调，避免影响后续断言）。
+        let lockProbe = WidgetContainerView(frame: NSRect(x: 0, y: 0, width: panel, height: panel))
+        lockProbe.hitMask = container.hitMask
+        lockProbe.locked = true
+        var rightClicksDuringLock = 0
+        lockProbe.onRightClick = { _ in rightClicksDuringLock += 1 }
+        if let right = mouseEvent(.rightMouseDown, at: bodyView) {
+            lockProbe.rightMouseDown(with: right)
+            pump(0.1)
+        }
+        check("锁定后右键不唤出菜单", rightClicksDuringLock == 0,
+              "回调 \(rightClicksDuringLock) 次")
+        // 对照：未锁定时右键必须仍然可用，否则菜单按钮被隐藏的用户就没有入口了
+        lockProbe.locked = false
+        if let right = mouseEvent(.rightMouseDown, at: bodyView) {
+            lockProbe.rightMouseDown(with: right)
+            pump(0.1)
+        }
+        check("未锁定时右键仍可唤出菜单", rightClicksDuringLock == 1,
+              "回调 \(rightClicksDuringLock) 次")
+
+        store.update { $0.locked = false }
+        controller.applyInteractionState()
+        pump(0.15)
+        check("解除锁定后容器恢复可交互", !controller.container.locked)
+        click(at: bodyView)
+        check("解除锁定后角色本体恢复可点击", bubble.isOpen)
+        bubble.close()
+
+        print("== 端到端：不透明度 ==")
+        // 不透明度必须**落在视图渲染出来的像素**上（用户看到的就是这个），
+        // 而不是只存在配置里。
+        store.update { $0.opacity = 1.0 }
+        pump(0.1)
+        let opaquePixels = alphaSampler(1.0)
+        store.update { $0.opacity = 0.4 }
+        pump(0.1)
+        let fadedPixels = alphaSampler(0.4)
+
+        check("面板渲染像素确实变淡（不只是配置值变了）",
+              fadedPixels.maxAlpha < opaquePixels.maxAlpha,
+              String(format: "最大 alpha 1.0→%.2f，0.4→%.2f",
+                     opaquePixels.maxAlpha, fadedPixels.maxAlpha))
+        check("不透明度 0.4 时像素 alpha 约为 0.4",
+              abs(fadedPixels.maxAlpha - 0.4) < 0.06,
+              String(format: "实测最大 alpha %.3f", fadedPixels.maxAlpha))
+        check("不透明度 1.0 时像素不透明",
+              opaquePixels.maxAlpha > 0.95,
+              String(format: "实测最大 alpha %.3f", opaquePixels.maxAlpha))
+
+        // 减淡不该影响可点击性：命中判定与不透明度无关
+        bubble.close()
+        click(at: bodyView)
+        check("减淡后角色本体仍可点击", bubble.isOpen)
+        bubble.close()
+        store.update { $0.opacity = 1.0 }
+        controller.applyInteractionState()
 
         print("== 端到端：可交互区域只命中图案像素 ==")
         // 面板左上角是透明区（小鲸鱼在右下），点击这里不应展开气泡

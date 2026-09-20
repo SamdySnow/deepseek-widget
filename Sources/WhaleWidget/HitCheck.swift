@@ -390,6 +390,164 @@ enum HitCheck {
                      counts["character", default: 0], counts["menuButton", default: 0],
                      counts["bubble", default: 0], counts["transparent", default: 0]))
 
+        print("== 锁定（整块面板 click-through）==")
+        // 锁定的语义：**没有任何区域**接收事件 —— 包括角色本体与菜单按钮。
+        let lockPoints: [(String, CGFloat, CGFloat)] = [
+            ("角色本体", whaleNorm.midX, whaleNorm.midY),
+            ("菜单按钮", buttonRect.midX, buttonRect.midY),
+            ("气泡中心", cx, cy),
+            ("透明角落", 0.02, 0.98),
+        ]
+        var lockAllCovered = true
+        for (name, nx, ny) in lockPoints {
+            let z = EventRouting.zone(at: CGPoint(x: nx, y: ny), hitMask: routingMask,
+                                      panelSide: panel, menuButtonRect: buttonRect,
+                                      locked: true)
+            if z != .locked { lockAllCovered = false; print("     ↳ \(name) 判成了 \(z)") }
+        }
+        check("锁定后所有位置都判为 locked（含角色本体与菜单按钮）", lockAllCovered,
+              "取样 \(lockPoints.count) 处")
+        check("锁定态不接收事件", !EventRouting.acceptsEvents(.locked))
+
+        // 关键差异：`locked` 与 `bubble`/`transparent` 都「不接收事件」，
+        // 但对**命中测试**的要求不同 —— 后两者本就不在遮罩内，
+        // 而锁定态下的角色本体必须显式放行。
+        // 若 locked 漏掉 hitTestable=false，容器会把这一下当成点本体
+        // → 锁定后仍然能点出气泡（锁定形同虚设）。
+        check("锁定态必须让命中测试也放行（否则事件仍会交给容器）",
+              !EventRouting.behavior(.locked).hitTestable,
+              "hitTestable=\(EventRouting.behavior(.locked).hitTestable)")
+        check("锁定态禁止拖动与推进气泡",
+              !EventRouting.behavior(.locked).draggable
+                && !EventRouting.behavior(.locked).advancesBubble)
+        // 对照：未锁定时角色本体照常接收（锁定没有波及默认状态）
+        check("未锁定时角色本体仍接收事件",
+              EventRouting.zone(at: CGPoint(x: whaleNorm.midX, y: whaleNorm.midY),
+                                hitMask: routingMask, panelSide: panel,
+                                menuButtonRect: buttonRect, locked: false) == .character)
+        // 菜单按钮不推进气泡序列 —— 否则会出现「点菜单按钮，气泡也跳一格」
+        check("菜单按钮不推进气泡序列",
+              !EventRouting.behavior(.menuButton).advancesBubble)
+        // behavior 与 acceptsEvents 是同一份语义的两种取法，不允许漂移
+        var behaviorConsistent = true
+        for z in [EventRouting.Zone.character, .menuButton, .bubble, .transparent, .locked]
+        where EventRouting.acceptsEvents(z) != EventRouting.behavior(z).acceptsEvents {
+            behaviorConsistent = false
+        }
+        check("acceptsEvents 与 behavior 判定一致", behaviorConsistent)
+
+        print("== 不透明度 ==")
+        // 下限**不为 0**：完全透明会让挂件消失，而用户未必记得菜单里有这个滑块
+        check("不透明度范围不含 0（避免挂件彻底不可见）",
+              AppConfig.opacityRange.lowerBound > 0,
+              "\(AppConfig.opacityRange.lowerBound)…\(AppConfig.opacityRange.upperBound)")
+
+        var opConfig = AppConfig()
+        check("默认不透明度为 1.0", opConfig.panelOpacity == 1.0, "\(opConfig.panelOpacity)")
+        opConfig.opacity = nil
+        check("未设置（nil）时不透明度为 1.0", opConfig.panelOpacity == 1.0)
+        opConfig.opacity = 0.45
+        check("范围内的值原样返回", abs(opConfig.panelOpacity - 0.45) < 1e-9)
+        opConfig.opacity = 5.0
+        check("越界上值夹回上限", opConfig.panelOpacity == AppConfig.opacityRange.upperBound,
+              "\(opConfig.panelOpacity)")
+        opConfig.opacity = -3
+        check("越界下值夹回下限（手改配置不会让它变成 0）",
+              opConfig.panelOpacity == AppConfig.opacityRange.lowerBound,
+              "\(opConfig.panelOpacity)")
+        opConfig.opacity = .nan
+        check("NaN 回退为 1.0（手改配置不该让挂件消失）", opConfig.panelOpacity == 1.0)
+        opConfig.opacity = .infinity
+        check("无穷大回退为 1.0", opConfig.panelOpacity == 1.0)
+
+        print("== 配置兼容（旧文件不能丢字段）==")
+        // `locked` / `opacity` 写成 Optional 就是为了让**旧配置**照常解码：
+        // Swift 合成的解码器**不会**用属性默认值兜住缺失的键，若写成非 Optional，
+        // 之前版本写出的 config.json（没有这两个键）会抛 keyNotFound
+        // → `load()` 返回 nil → 用户的缩放 / 位置 / 开关被静默重置。
+        //
+        // 模拟方式要**真实**：拿一份完整的配置，删掉这两个新键再解码。
+        // （用一个只含两三个键的 JSON 是错的 —— 那样连 `volume`、`peakStyle`
+        // 这些**早就有**的必填键都缺失，失败的原因与本次改动无关。）
+        var full = AppConfig()
+        full.scale = 2.0
+        full.soundOn = false
+        full.lastSide = "left"
+        full.lastX = 123.5
+        full.lastY = 456.25
+        full.menuButtonHidden = true
+        full.opacity = 0.5
+        full.locked = true
+
+        guard let encoded = try? JSONEncoder().encode(full),
+              var dict = (try? JSONSerialization.jsonObject(with: encoded)) as? [String: Any] else {
+            check("能构造旧版配置样本", false)
+            return failures == 0 ? 0 : 1
+        }
+        for key in ["locked", "opacity"] { dict.removeValue(forKey: key) }
+        check("样本确实不含新键（模拟旧版本写出的文件）",
+              dict["locked"] == nil && dict["opacity"] == nil)
+        check("样本仍含全部旧键（这才是旧配置的真实样子）",
+              dict["scale"] != nil && dict["volume"] != nil && dict["peakStyle"] != nil
+                && dict["snapMargin"] != nil && dict["updatedAt"] != nil,
+              "\(dict.count) 个键")
+
+        if let legacyData = try? JSONSerialization.data(withJSONObject: dict),
+           let legacy = try? JSONDecoder().decode(AppConfig.self, from: legacyData) {
+            check("旧配置（无 locked / opacity 键）可解码", true)
+            check("旧配置的已有字段被保留",
+                  legacy.scale == 2.0 && !legacy.soundOn && legacy.lastSide == "left"
+                    && legacy.lastX == 123.5 && legacy.menuButtonHidden,
+                  "scale=\(legacy.scale) lastSide=\(legacy.lastSide) x=\(legacy.lastX ?? -1)")
+            check("缺失的 locked 视为未锁定", !legacy.isLocked)
+            check("缺失的 opacity 视为 1.0", legacy.panelOpacity == 1.0)
+        } else {
+            check("旧配置（无 locked / opacity 键）可解码", false,
+                  "解码失败 → 用户配置会被静默重置")
+        }
+
+        // 往返：新字段写入后能读回
+        if let data = try? JSONEncoder().encode(full),
+           let back = try? JSONDecoder().decode(AppConfig.self, from: data) {
+            check("locked / opacity 可完整往返",
+                  back.isLocked && abs(back.panelOpacity - 0.5) < 1e-9,
+                  "locked=\(back.isLocked) opacity=\(back.panelOpacity)")
+        } else {
+            check("locked / opacity 可完整往返", false)
+        }
+
+        // 把「为什么必须写成 Optional」本身钉成断言。
+        // 免得日后有人觉得「带默认值的非 Optional 更干净」而改回去 ——
+        // 那样旧配置会直接解码失败，用户的缩放 / 位置会被静默重置。
+        struct NonOptionalCounterpart: Codable {
+            var locked: Bool = false
+            var opacity: Double = 1.0
+        }
+        if let legacyData = try? JSONSerialization.data(withJSONObject: dict) {
+            let failsWithoutOptional =
+                (try? JSONDecoder().decode(NonOptionalCounterpart.self, from: legacyData)) == nil
+            check("对照：同样的键写成非 Optional 就会解码失败（这就是必须 Optional 的原因）",
+                  failsWithoutOptional,
+                  failsWithoutOptional
+                    ? "非 Optional 版本确实失败，Swift 不会用属性默认值兜住缺失的键"
+                    : "居然成功了 —— 若合成解码器行为变了，本处注解需更新")
+        }
+
+        print("== 配置变更必须通知视图重绘 ==")
+        // 不透明度滑块要让挂件**立刻**变淡：视图观察的是 store，
+        // 所以 store.config 的变更必须发出 objectWillChange。
+        let configStore = WhaleStore()
+        var configNotifications = 0
+        let configToken = configStore.objectWillChange.sink { _ in configNotifications += 1 }
+        defer { configToken.cancel() }
+        configStore.update { $0.opacity = 0.5 }
+        check("改不透明度会通知视图重绘", configNotifications > 0,
+              "\(configNotifications) 次 objectWillChange")
+        configNotifications = 0
+        configStore.update { $0.locked = true }
+        check("切换锁定会通知视图重绘（锁定角标要立刻出现）",
+              configNotifications > 0, "\(configNotifications) 次 objectWillChange")
+
         print("== 视觉更新通知（点击必须让视图重绘）==")
         // 这是本轮 bug 的核心：`queueIndex` 原本不是 @Published，
         // 第 2 次点击时 `isOpen` 已是 true（值没变）、`queueIndex` 又发不出通知，

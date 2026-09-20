@@ -37,3 +37,18 @@ row = book["days"][d["date"]]
 print("date:", d["date"], "| balance:", d["lastBalance"], "| today:", d["todayUsage"])
 print("observations:", row["firstAt"], "->", row["lastAt"])
 PY
+
+echo "--- panel interaction ---"
+/usr/bin/python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path.home() / ".whale-widget-mac" / "config.json"
+if not p.exists():
+    print("no config")
+    raise SystemExit
+c = json.loads(p.read_text())
+# 锁定 = 整块窗口 click-through（挂件本身不可交互），
+# 不透明度越小越淡。排查「挂件点不动 / 看不见」先看这两项。
+print("locked:", c.get("locked", False), "（True 时挂件不响应鼠标，需从菜单栏 🐋 解锁）")
+print("opacity:", c.get("opacity", 1.0), "（缺失 = 1.0）")
+print("snapEnabled:", c.get("snapEnabled", True))
+PY

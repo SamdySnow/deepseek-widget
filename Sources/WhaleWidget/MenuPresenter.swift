@@ -14,6 +14,7 @@ final class MenuPresenter {
               soundPlayer: SoundPlayer,
               anchorWindow: NSWindow?,
               onScaleChange: @escaping () -> Void,
+              onInteractionChange: @escaping () -> Void = {},
               onClose: @escaping () -> Void) {
 
         closeCurrent()
@@ -23,6 +24,7 @@ final class MenuPresenter {
             bubble: bubble,
             soundPlayer: soundPlayer,
             onScaleChange: onScaleChange,
+            onInteractionChange: onInteractionChange,
             onOpenUsage: { [weak self] in self?.openUsage(store: store, bubble: bubble) },
             onOpenBubbleEditor: { [weak self] in self?.openBubbleEditor(bubble: bubble, store: store) },
             onReconcile: { [weak self] in self?.openReconcile(store: store) },

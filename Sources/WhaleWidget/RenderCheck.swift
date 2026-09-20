@@ -172,8 +172,85 @@ enum RenderCheck {
             check("缩放 \(scale)× 可渲染（边长 \(Int(side))px）", image != nil)
         }
 
+        // 5) 锁定角标：锁定后整块面板都不响应鼠标，界面上必须有可见反馈，
+        //    否则用户会以为挂件坏了。这里用「菜单按钮区域出现白色像素」来判定 ——
+        //    菜单按钮在锁定态会被隐藏、改由角标占据同一位置。
+        //    用差分而不是绝对阈值：先把两个状态都渲染出来再比，避免受缩放 / 主题影响。
+        store.update { $0.locked = false; $0.menuButtonHidden = true; $0.opacity = 1.0 }
+        let unlocked = render(store: store, bubble: bubble, side: 450)
+        store.update { $0.locked = true }
+        let locked = render(store: store, bubble: bubble, side: 450)
+        if let unlocked, let locked {
+            write(locked, to: "\(outputDir)/panel-locked.png")
+            let whiteUnlocked = whiteInButtonRect(unlocked)
+            let whiteLocked = whiteInButtonRect(locked)
+            check("锁定后在菜单按钮位置画出锁定角标（比未锁定时更亮）",
+                  whiteLocked > whiteUnlocked,
+                  String(format: "按钮区白色像素 未锁定 %d → 锁定 %d", whiteUnlocked, whiteLocked))
+            check("锁定角标确实可见（该区域有明显白色像素）", whiteLocked > 100,
+                  "\(whiteLocked) 像素")
+        } else {
+            check("能渲染锁定态", false)
+        }
+        store.update { $0.locked = false; $0.menuButtonHidden = false }
+
+        // 6) 不透明度要真的改变渲染像素（用户看到的就是这一层）。
+        //    下限不为 0 是刻意的：完全透明会让挂件「消失」而用户未必记得有这个滑块。
+        let full = render(store: store, bubble: bubble, side: 450)
+        store.update { $0.opacity = AppConfig.opacityRange.lowerBound }
+        let faint = render(store: store, bubble: bubble, side: 450)
+        store.update { $0.opacity = 1.0 }
+        if let full, let faint, let fullRep = bitmap(full), let faintRep = bitmap(faint) {
+            let fullMax = maxAlpha(fullRep)
+            let faintMax = maxAlpha(faintRep)
+            check("不透明度会改变渲染像素（不只是改了配置值）",
+                  faintMax < fullMax,
+                  String(format: "最大 alpha %.2f → %.2f", fullMax, faintMax))
+            check("下限 \(AppConfig.opacityRange.lowerBound) 时仍可见（不为 0）",
+                  faintMax > 0.1,
+                  String(format: "最大 alpha %.2f", faintMax))
+        } else {
+            check("能渲染不透明度的两个档位", false)
+        }
+
         print(failures == 0 ? "\n渲染校验全部通过 ✅" : "\n有 \(failures) 项失败 ❌")
         return failures == 0 ? 0 : 1
+    }
+
+    /// 菜单按钮所在矩形内的白色像素数（用于判定锁定角标是否画出来了）。
+    private static func whiteInButtonRect(_ image: NSImage) -> Int {
+        guard let rep = bitmap(image) else { return 0 }
+        let w = rep.pixelsWide, h = rep.pixelsHigh
+        let rect = Positioning.menuButtonRectNormalized
+        var count = 0
+        for y in 0..<h {
+            for x in 0..<w {
+                let nx = Double(x) / Double(w)
+                let ny = Double(y) / Double(h)
+                guard rect.contains(CGPoint(x: nx, y: ny)) else { continue }
+                guard let c = rep.colorAt(x: x, y: y), c.alphaComponent > 0.5 else { continue }
+                if c.redComponent > 0.9, c.greenComponent > 0.9, c.blueComponent > 0.9 {
+                    count += 1
+                }
+            }
+        }
+        return count
+    }
+
+    private static func bitmap(_ image: NSImage) -> NSBitmapImageRep? {
+        guard let tiff = image.tiffRepresentation else { return nil }
+        return NSBitmapImageRep(data: tiff)
+    }
+
+    private static func maxAlpha(_ rep: NSBitmapImageRep) -> Double {
+        var maxA = 0.0
+        for y in stride(from: 0, to: rep.pixelsHigh, by: 2) {
+            for x in stride(from: 0, to: rep.pixelsWide, by: 2) {
+                guard let c = rep.colorAt(x: x, y: y) else { continue }
+                maxA = Swift.max(maxA, Double(c.alphaComponent))
+            }
+        }
+        return maxA
     }
 
     /// 与 PanelController.panelSide() 保持一致。
