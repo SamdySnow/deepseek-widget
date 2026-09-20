@@ -21,6 +21,11 @@ struct MenuView: View {
     @State private var apiKeyInput: String = ""
     @State private var showKeyField = false
 
+    /// 开机自启动的登记状态。真值来自 LaunchAgent plist 文件本身，这里只是一份
+    /// 快照：每次菜单出现（`onAppear`）与每次开关后重新读取，避免每帧都去读磁盘。
+    @State private var autoLaunchStatus: AutoLaunch.Status = .off
+    @State private var autoLaunchError: String?
+
     private let accent = Color(red: 0.125, green: 0.192, blue: 0.439)   // #203170
 
     var body: some View {
@@ -189,6 +194,10 @@ struct MenuView: View {
 
             Divider()
 
+            autoLaunchSection
+
+            Divider()
+
             HStack {
                 Button("用量记录") { onOpenUsage() }
                 Button("自定义泡泡") { onOpenBubbleEditor() }
@@ -222,6 +231,36 @@ struct MenuView: View {
         )
         .colorScheme(.light)
         .foregroundColor(accent)
+        // 菜单每次出现都重新读一次登录项状态：用户可能在「系统设置」或终端里
+        // 改过它，只有重读才不会显示成过期的开关状态。
+        .onAppear { autoLaunchStatus = AutoLaunch.status() }
+        // 另一个界面改了同一个状态（例如设置窗口开着时从菜单栏 🐋 拨了开关）→
+        // 跟着重新读盘。少了这条，两处会各显示一套状态，看起来像开关失灵。
+        // 用 object: nil 接收全部广播：登记者只要是「本进程的 AutoLaunch」即可。
+        .onReceive(NotificationCenter.default.publisher(
+            for: AutoLaunch.didChangeNotification)) { _ in
+                autoLaunchStatus = AutoLaunch.status()
+            }
+    }
+
+    // MARK: - 开机自启动
+
+    /// 开关状态与错误提示抽到 `AutoLaunchSection`（纯展示视图，可离屏渲染断言）。
+    private var autoLaunchSection: some View {
+        AutoLaunchSection(
+            status: autoLaunchStatus,
+            error: autoLaunchError,
+            executable: AutoLaunch.executablePath,
+            onToggle: { setAutoLaunch($0) },
+            onFix: { setAutoLaunch(true) })
+    }
+
+    /// 切换开机自启动。真值来自文件系统，所以无论成功失败都重新读一次状态 ——
+    /// 不靠本地布尔值自己「记得」，避免界面与实际登记不一致。
+    /// 失败时把错误留下来显示：写入 LaunchAgents 失败需要用户知道并处理。
+    private func setAutoLaunch(_ enabled: Bool) {
+        autoLaunchError = AutoLaunch.setEnabled(enabled)
+        autoLaunchStatus = AutoLaunch.status()
     }
 
     private var header: some View {

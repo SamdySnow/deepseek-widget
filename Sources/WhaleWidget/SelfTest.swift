@@ -364,6 +364,180 @@ enum SelfTest {
               PointerIntent.isDrag(from: mouseStart,
                                    to: CGPoint(x: 1210, y: 600)))
 
+        print("== 开机自启动 ==")
+        // 这两个断言放在最前面：它们是后面所有写文件断言的前提 ——
+        // 若隔离失效，下面的 install() 就会往用户真实的 ~/Library/LaunchAgents 里写东西。
+        check("自检下的登录项目录与真实目录不同（隔离生效）",
+              AutoLaunch.directory != AutoLaunch.realDirectory,
+              AutoLaunch.directory.path)
+        check("真实登录项目录确为 ~/Library/LaunchAgents",
+              AutoLaunch.realDirectory.path
+                == FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library/LaunchAgents").path,
+              AutoLaunch.realDirectory.path)
+
+        let fakeBinary = "/tmp/whale-selftest-fake-binary"
+        let contents = AutoLaunch.plistContents(
+            executable: fakeBinary,
+            logDirectory: URL(fileURLWithPath: "/tmp/whale-selftest-logs"))
+        check("plist: RunAtLoad 为真（登录即启动）",
+              contents["RunAtLoad"] as? Bool == true)
+        // KeepAlive 必须为假：否则用户在菜单里「退出」会被 launchd 立刻拉起来，
+        // 变成一个关不掉的应用。
+        check("plist: KeepAlive 为假（退出后不被拉起）",
+              contents["KeepAlive"] as? Bool == false)
+        check("plist: ProgramArguments 指向可执行文件",
+              (contents["ProgramArguments"] as? [String]) == [fakeBinary],
+              (contents["ProgramArguments"] as? [String])?.joined(separator: " ") ?? "nil")
+        check("plist: Label 与常量一致", contents["Label"] as? String == AutoLaunch.label)
+        check("plist: 限定 Aqua 会话（不在 ssh 等后台会话启动）",
+              contents["LimitLoadToSessionType"] as? String == "Aqua")
+        check("plist: 日志路径落在给定目录",
+              (contents["StandardErrorPath"] as? String)?
+                .hasPrefix("/tmp/whale-selftest-logs/") == true,
+              contents["StandardErrorPath"] as? String ?? "nil")
+        let withoutLogs = AutoLaunch.plistContents(executable: fakeBinary, logDirectory: nil)
+        check("plist: 不写日志键时不出现空日志路径（降级路径）",
+              withoutLogs["StandardErrorPath"] == nil)
+
+        check("初始状态为未开启", AutoLaunch.status(executable: fakeBinary) == .off)
+
+        // 开启 → 状态变 on，且文件确实落到隔离目录。
+        // 显式传入 executable：默认值会取**当前进程**，那样断言就变成在测运行时
+        // 二进制位置（构建目录随环境变），而不是「install 与 status 是否一致」。
+        check("开启返回成功", AutoLaunch.setEnabled(true, executable: fakeBinary) == nil)
+        check("开启后状态为 on",
+              AutoLaunch.status(executable: fakeBinary) == .on,
+              "\(AutoLaunch.status(executable: fakeBinary))")
+        check("确实写入了 \(AutoLaunch.plistURL.lastPathComponent)",
+              FileManager.default.fileExists(atPath: AutoLaunch.plistURL.path))
+        check("写成的是可解析的 plist（XML 格式）",
+              (try? PropertyListSerialization.propertyList(
+                  from: Data(contentsOf: AutoLaunch.plistURL), format: nil)) != nil)
+
+        // 幂等：重复开启不报错、内容不变
+        check("重复开启是幂等的", AutoLaunch.setEnabled(true, executable: fakeBinary) == nil)
+        check("重复开启后仍为 on", AutoLaunch.status(executable: fakeBinary) == .on)
+
+        // 二进制被移动 / 重新构建过 → 必须能识别为「指向旧位置」，
+        // 否则界面会显示成「已开启」，而实际开机启动的是另一个程序。
+        check("二进制换位置后识别为「指向旧位置」",
+              AutoLaunch.status(executable: "/tmp/whale-moved-binary")
+                == .stale(registered: fakeBinary),
+              "\(AutoLaunch.status(executable: "/tmp/whale-moved-binary"))")
+        check("「指向旧位置」在界面上仍算已登记（开关不该显示为关）",
+              AutoLaunch.status(executable: "/tmp/whale-moved-binary").isRegistered)
+        check("「指向旧位置」不算就绪（isOn 为假）",
+              !AutoLaunch.status(executable: "/tmp/whale-moved-binary").isOn)
+
+        // 重新开启一次就能修正成当前程序（界面上的「改为当前程序」按钮走这条路）
+        check("重新开启可把旧位置修正为当前程序",
+              AutoLaunch.setEnabled(true, executable: "/tmp/whale-moved-binary") == nil
+                && AutoLaunch.status(executable: "/tmp/whale-moved-binary") == .on)
+        check("修正后旧的路径不再算本作业",
+              AutoLaunch.status(executable: fakeBinary)
+                == .stale(registered: "/tmp/whale-moved-binary"))
+        // 直接读盘核对 —— 不能拿 plistContents() 的返回值来断言，
+        // 那是纯函数，无论文件写没写都会给出同样的内容。
+        let onDisk = (try? PropertyListSerialization.propertyList(
+            from: Data(contentsOf: AutoLaunch.plistURL), format: nil)) as? [String: Any]
+        check("修正后磁盘上的 ProgramArguments 确实是新路径",
+              (onDisk?["ProgramArguments"] as? [String]) == ["/tmp/whale-moved-binary"],
+              (onDisk?["ProgramArguments"] as? [String])?.joined(separator: " ") ?? "nil")
+
+        // 关掉 → 文件移除、状态回到 off，且重复关闭幂等
+        check("关闭返回成功", AutoLaunch.remove() == nil)
+        check("关闭后状态为 off", AutoLaunch.status(executable: fakeBinary) == .off)
+        check("关闭后 plist 已删除",
+              !FileManager.default.fileExists(atPath: AutoLaunch.plistURL.path))
+        check("重复关闭是幂等的（本来就没开）", AutoLaunch.remove() == nil)
+
+        // 别把别人的登录项当成自己的：Label 对不上就要报未开启
+        try? FileManager.default.createDirectory(at: AutoLaunch.directory,
+                                                withIntermediateDirectories: true)
+        let foreign: [String: Any] = ["Label": "com.example.someoneelse",
+                                      "ProgramArguments": ["/usr/bin/true"]]
+        if let data = try? PropertyListSerialization.data(fromPropertyList: foreign,
+                                                          format: .xml, options: 0) {
+            try? data.write(to: AutoLaunch.plistURL)
+        }
+        check("Label 不匹配的同名文件不算本作业的登记",
+              AutoLaunch.status(executable: fakeBinary) == .off)
+        _ = AutoLaunch.remove()
+
+        check("取得到当前可执行文件路径（打包与裸二进制都可用）",
+              AutoLaunch.executablePath?.hasPrefix("/") == true,
+              AutoLaunch.executablePath ?? "nil")
+
+        print("== 单实例守卫 ==")
+        // 开了自启动之后「同时跑两份」变成常态：登录时 launchd 拉起一份，
+        // 用户又双击了 .app。这里验证加锁生效、且第二个进程会自己让位。
+        //
+        // 断言一律用**临时锁文件**，不碰 /tmp 里真实挂件的那把锁：
+        // 否则「用户正开着挂件时跑一次自检」会直接变红，而那跟被测代码无关。
+        let lockPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("whale-selftest-lock-\(ProcessInfo.processInfo.processIdentifier)")
+        let lockURL = URL(fileURLWithPath: lockPath.path)
+        defer { try? FileManager.default.removeItem(at: lockURL) }
+
+        check("本进程能取得单实例锁", SingleInstance.acquire(at: lockURL))
+        // 关键回归：同一进程重复 acquire 必须仍然成功。
+        // 少了「已持有就直接返回」这一句时，第二次 open() 会拿到另一条
+        // open file description，flock 把它当成竞争者而拒绝 → 自我抢锁失败。
+        check("重复取得是幂等的（同一进程再拿一次仍成功）",
+              SingleInstance.acquire(at: lockURL))
+        check("默认锁文件位于 /tmp（与用户配置目录无关）",
+              SingleInstance.lockURL.path.hasPrefix("/tmp/whale-widget-"))
+
+        // 真·跨进程验证：用同一个二进制起一个子进程去抢同一把锁。
+        // 只在能定位到自己的可执行文件时跑，否则宁可显式失败也不要静默跳过。
+        if let me = AutoLaunch.executablePath, FileManager.default.isExecutableFile(atPath: me) {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: me)
+            // 这个入口只做一件事：抢锁 → 抢到 return 0，抢不到 return 7。
+            // 用专有退出码而不是 0/1，是为了把「让位」与「崩溃」区分开。
+            proc.arguments = ["--probe-single-instance"]
+            var env = ProcessInfo.processInfo.environment
+            env["WHALE_LOCK_PATH"] = lockPath.path
+            proc.environment = env
+            proc.standardOutput = Pipe()
+            proc.standardError = Pipe()
+            if (try? proc.run()) != nil {
+                proc.waitUntilExit()
+                check("已有实例在跑时，第二个进程主动让位（退出码 7）",
+                      proc.terminationStatus == 7,
+                      "退出码 \(proc.terminationStatus)")
+            } else {
+                check("能启动子进程做跨进程锁校验", false)
+            }
+
+            // 对照：换成一把没人持有的锁，同一个子进程应当拿到并正常退出。
+            // 没有这条对照的话，「退出码 7」也可能只是因为子进程压根起不来 / 参数没接住
+            // —— 那样上面那条断言就成了自我实现。
+            let freePath = FileManager.default.temporaryDirectory
+                .appendingPathComponent("whale-selftest-free-\(ProcessInfo.processInfo.processIdentifier)")
+            defer { try? FileManager.default.removeItem(at: freePath) }
+            let free = Process()
+            free.executableURL = URL(fileURLWithPath: me)
+            free.arguments = ["--probe-single-instance"]
+            var freeEnv = ProcessInfo.processInfo.environment
+            freeEnv["WHALE_LOCK_PATH"] = freePath.path
+            free.environment = freeEnv
+            free.standardOutput = Pipe()
+            free.standardError = Pipe()
+            if (try? free.run()) != nil {
+                free.waitUntilExit()
+                check("对照：锁空闲时同一个子进程能取得并正常退出（退出码 0）",
+                      free.terminationStatus == 0,
+                      "退出码 \(free.terminationStatus)")
+            } else {
+                check("能启动子进程做对照校验", false)
+            }
+        } else {
+            check("能定位自身可执行文件以做跨进程校验", false,
+                  AutoLaunch.executablePath ?? "nil")
+        }
+
         print("== 资源 ==")
         check("资源目录可定位", Assets.directory != nil,
               Assets.directory?.path ?? "未找到")

@@ -355,8 +355,173 @@ enum RenderCheck {
             check("能渲染「关掉镜像」对照", false)
         }
 
+        // 7) 开机自启动一节：三种状态各自要传达的信息完全不同，必须逐个画出来验。
+        //
+        //    为什么值得做像素断言：这一节最容易出的问题不是"画错了"而是
+        //    **状态分支掉了** —— 例如「已登记但指向旧位置」静默走了普通的
+        //    「已登记」分支，用户看到开关是开的、没有任何异常提示，
+        //    直到重启后才发现开机启动的是个旧程序。这种问题读代码看不出来，
+        //    只能靠「警告确实被画出来了」来钉住。
+        let stalePath = "/Applications/WhaleWidget.app/Contents/MacOS/WhaleWidget"
+        let autoLaunchCases: [(String, AutoLaunch.Status, String?)] = [
+            ("未开启", .off, nil),
+            ("已登记", .on, nil),
+            ("指向旧位置", .stale(registered: stalePath), nil),
+            ("写入失败", .off, "无法创建 ~/Library/LaunchAgents：权限不足"),
+        ]
+        var autoLaunchInk: [String: Int] = [:]
+        for (label, status, error) in autoLaunchCases {
+            guard let image = renderAutoLaunchSection(status: status, error: error,
+                                                      executable: "/tmp/WhaleWidget") else {
+                check("能渲染「开机自启动 · \(label)」", false); continue
+            }
+            write(image, to: "\(outputDir)/autolaunch-\(label).png")
+            let ink = inkPixelCount(image)
+            autoLaunchInk[label] = ink
+            check("「开机自启动 · \(label)」渲染出内容", ink > 200, "墨迹像素 \(ink)")
+        }
+
+        // 诊断：单独渲染裸 Toggle（开/关各一次）—— 用来固化「开关自带强调色像素」
+        // 这个事实。它是下面所有断言只用**提示区**（不含开关）做判据的直接依据：
+        // 只要这条诊断里两个状态的橙色数相同且非 0，就说明「整节橙色数」
+        // 无法分辨有没有警告。
+        var bareOn = 0, bareOff = 0
+        for isOn in [true, false] {
+            if let image = renderBareToggle(isOn: isOn) {
+                write(image, to: "\(outputDir)/autolaunch-bare-toggle-\(isOn ? "on" : "off").png")
+                let orange = orangePixelCount(image)
+                if isOn { bareOn = orange } else { bareOff = orange }
+            }
+        }
+        check("开关自身就带强调色像素，且开/关数值相同（所以不能用整节橙色数判警告）",
+              bareOn > 0 && bareOn == bareOff,
+              "开=\(bareOn) 关=\(bareOff)")
+
+        // 警告必须是**橙色**，且只出现在该出现的状态里。
+        // 判据用**提示区**（AutoLaunchNotice，不含开关）：橙色在这里只可能是警告。
+        var noticeOrange: [String: Int] = [:]
+        for (label, status, error) in autoLaunchCases {
+            guard let image = renderAutoLaunchNotice(status: status, error: error,
+                                                     executable: "/tmp/WhaleWidget") else {
+                check("能渲染「开机自启动提示 · \(label)」", false); continue
+            }
+            write(image, to: "\(outputDir)/autolaunch-notice-\(label).png")
+            noticeOrange[label] = orangePixelCount(image)
+        }
+
+        check("「指向旧位置」画出橙色警告",
+              (noticeOrange["指向旧位置"] ?? 0) > 50,
+              "橙色像素 \(noticeOrange["指向旧位置"] ?? 0)")
+        check("「未开启」不画警告（避免无事发生的状态也在喊狼来了）",
+              (noticeOrange["未开启"] ?? 0) == 0,
+              "橙色像素 \(noticeOrange["未开启"] ?? 0)")
+        check("「已登记」不画警告（完全就绪就不该报警）",
+              (noticeOrange["已登记"] ?? 0) == 0,
+              "橙色像素 \(noticeOrange["已登记"] ?? 0)")
+        check("写入失败时也画出橙色警告",
+              (noticeOrange["写入失败"] ?? 0) > 50,
+              "橙色像素 \(noticeOrange["写入失败"] ?? 0)")
+
+        // 「指向旧位置」必须比「已登记」多画东西（警告文案 + 路径 + 修复按钮）。
+        // 若哪天这个分支被删掉、退回普通显示，这条会先变红。
+        check("「指向旧位置」比「已登记」多出可见内容（多一行警告与修复按钮）",
+              (autoLaunchInk["指向旧位置"] ?? 0) > (autoLaunchInk["已登记"] ?? 0),
+              "墨迹 \(autoLaunchInk["已登记"] ?? 0) → \(autoLaunchInk["指向旧位置"] ?? 0)")
+
+        // 提示区本身必须与普通态不同 —— 不能只是多了一个开关。
+        // 用提示区（不含开关）比对：开关会淹没差异（它在任何状态下都画同样的像素）。
+        if let staleNotice = renderAutoLaunchNotice(status: .stale(registered: stalePath),
+                                                    error: nil, executable: "/tmp/WhaleWidget"),
+           let plainNotice = renderAutoLaunchNotice(status: .on, error: nil,
+                                                    executable: "/tmp/WhaleWidget") {
+            check("提示区在「指向旧位置」与「已登记」下像素确实不同",
+                  imageDifferenceRatio(staleNotice, plainNotice) > 0.01,
+                  String(format: "差异 %.4f", imageDifferenceRatio(staleNotice, plainNotice)))
+        } else {
+            check("能渲染提示区做差异比对", false)
+        }
+
         print(failures == 0 ? "\n渲染校验全部通过 ✅" : "\n有 \(failures) 项失败 ❌")
         return failures == 0 ? 0 : 1
+    }
+
+    /// 渲染「开机自启动」的**提示区**（不含开关）。
+    ///
+    /// 判据必须落在这里而不是整节：开关自身就带强调色像素（见
+    /// `renderBareToggle` 的对照断言），拿整节统计橙色永远分不出有没有警告。
+    private static func renderAutoLaunchNotice(status: AutoLaunch.Status,
+                                               error: String?,
+                                               executable: String?) -> NSImage? {
+        let view = AutoLaunchNotice(status: status, error: error, executable: executable,
+                                    onFix: {})
+            .padding(6)
+            .frame(width: 280, alignment: .leading)
+            .background(Color.clear)
+            .colorScheme(.light)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        renderer.isOpaque = false
+        return renderer.nsImage
+    }
+
+    /// 单独渲染一个裸 `Toggle`（对照用：确认开关本身是否自带橙色像素）。
+    private static func renderBareToggle(isOn: Bool) -> NSImage? {
+        let view = Toggle("开机自启动", isOn: .constant(isOn))
+            .padding(6)
+            .frame(width: 280)
+            .background(Color.clear)
+            .colorScheme(.light)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        renderer.isOpaque = false
+        return renderer.nsImage
+    }
+
+    /// 渲染「开机自启动」一节（三种状态共用同一个视图）。
+    private static func renderAutoLaunchSection(status: AutoLaunch.Status,
+                                                error: String?,
+                                                executable: String?) -> NSImage? {
+        let view = AutoLaunchSection(status: status, error: error, executable: executable,
+                                     onToggle: { _ in }, onFix: {})
+            .padding(6)
+            .frame(width: 280)
+            .background(Color.clear)
+            .colorScheme(.light)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        renderer.isOpaque = false
+        return renderer.nsImage
+    }
+
+    /// 不透明墨迹像素数（用于判断「这块内容确实被画出来了」）。
+    private static func inkPixelCount(_ image: NSImage) -> Int {
+        guard let rep = bitmap(image) else { return 0 }
+        var n = 0
+        for y in stride(from: 0, to: rep.pixelsHigh, by: 1) {
+            for x in stride(from: 0, to: rep.pixelsWide, by: 1) {
+                guard let c = rep.colorAt(x: x, y: y) else { continue }
+                if c.alphaComponent > 0.3 { n += 1 }
+            }
+        }
+        return n
+    }
+
+    /// 橙色像素数（警告色）。
+    ///
+    /// 判据刻意留得很宽（暖色、绿分量居中、蓝分量低），因为 SwiftUI 的
+    /// `Color.orange` 在不同色彩空间下数值会有出入 —— 这里要判的是
+    /// 「画的是警告色而不是普通文字色」，不需要精确到某个 RGB。
+    private static func orangePixelCount(_ image: NSImage) -> Int {
+        guard let rep = bitmap(image) else { return 0 }
+        var n = 0
+        for y in 0..<rep.pixelsHigh {
+            for x in 0..<rep.pixelsWide {
+                guard let c = rep.colorAt(x: x, y: y), c.alphaComponent > 0.6 else { continue }
+                let r = c.redComponent, g = c.greenComponent, b = c.blueComponent
+                if r > 0.70 && b < 0.45 && g > 0.20 && g < 0.85 { n += 1 }
+            }
+        }
+        return n
     }
 
     /// 提取文字的「位置无关字形掩码」：先取深蓝文字像素的包围盒，
