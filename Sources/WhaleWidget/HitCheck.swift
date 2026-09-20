@@ -23,6 +23,21 @@ enum HitCheck {
         let side: CGFloat = 450
         let width = side
 
+        print("== 版本信息（排查用）==")
+        // 把「哪个二进制在跑」钉住：自检结果与二进制路径/时间对不上时，
+        // 十有八九是在读旧的构建产物（本轮就吃过这个亏 —— 改了代码却
+        // 一直在跑上一次链接出来的二进制，白排查半天）。
+        if let exe = Bundle.main.executablePath,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: exe),
+           let date = attrs[.modificationDate] as? Date {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            print("  二进制: \(exe)")
+            print("  构建时间: \(f.string(from: date))")
+        } else {
+            print("  二进制: \(CommandLine.arguments.first ?? "?")")
+        }
+
         print("== 命中区域 ==")
 
         // 与 FloatingPanel 中的几何保持一致
@@ -547,6 +562,41 @@ enum HitCheck {
         configStore.update { $0.locked = true }
         check("切换锁定会通知视图重绘（锁定角标要立刻出现）",
               configNotifications > 0, "\(configNotifications) 次 objectWillChange")
+
+        print("== 临时提醒与点击的关系（确定性覆盖）==")
+        // 提醒泡泡（余额预警 / 预算 / 每轮消耗）存在时，`handleTap` 只关闭提醒、
+        // **不推进序列**。这条语义很重要，而它原先只在 `--e2e` 里被间接涉及 ——
+        // 但 e2e 会启动真实轮询，提醒出现的时机取决于网络，断言因此时红时绿
+        // （实测：同一段点击断言在不同次运行间结果不一致）。
+        // 所以在自检里直接构造提醒，把这层语义钉死；e2e 则关闭 alert 回调，
+        // 保证「点击序列」那一节的输入是确定性的。
+        let alertRuntime = BubbleRuntime()
+        alertRuntime.close()
+        alertRuntime.showAlert("测试提醒", seconds: 30)
+        check("能构造临时提醒", alertRuntime.transient != nil)
+
+        // 提醒在时点击：只关闭提醒，不展开序列
+        alertRuntime.handleTap(menuHidden: false)
+        check("提醒存在时点击 → 只关闭提醒，不推进序列",
+              alertRuntime.transient == nil && !alertRuntime.isOpen,
+              "transient=\(alertRuntime.transient != nil) isOpen=\(alertRuntime.isOpen)")
+        check("关闭提醒后队列位置仍为 0（没有被那次点击吃掉）",
+              alertRuntime.queueIndexForTesting == 0,
+              "queueIndex=\(alertRuntime.queueIndexForTesting)")
+
+        // 提醒清掉后再点，应当正常展开「首次点击泡」——
+        // 这正是 e2e 里「第 1 次点击没反应」的对照：有了这条，
+        // 同类问题下次能在不依赖网络的自检里定位。
+        alertRuntime.handleTap(menuHidden: false)
+        check("提醒关闭后再点击 → 正常展开首次点击泡",
+              alertRuntime.isOpen && alertRuntime.currentPage?.name == "首次点击泡",
+              alertRuntime.currentPage?.name ?? "nil")
+        alertRuntime.handleTap(menuHidden: false)
+        check("再点一次 → 推进到队列第 1 项",
+              alertRuntime.currentPage?.name == alertRuntime.config.queue[0].name,
+              alertRuntime.currentPage?.name ?? "nil")
+        alertRuntime.dismissTransient()
+        alertRuntime.close()
 
         print("== 视觉更新通知（点击必须让视图重绘）==")
         // 这是本轮 bug 的核心：`queueIndex` 原本不是 @Published，

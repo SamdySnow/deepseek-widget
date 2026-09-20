@@ -9,6 +9,10 @@ struct MenuView: View {
     var onScaleChange: () -> Void
     /// 锁定 / 不透明度变化后，让控制器重新计算穿透与吸附
     var onInteractionChange: () -> Void
+    /// 吸附 / 镜像开关变化后，让控制器重算位置与朝向
+    var onPositionChange: () -> Void
+    /// 重置位置到默认（右下角）
+    var onResetPosition: () -> Void
     var onOpenUsage: () -> Void
     var onOpenBubbleEditor: () -> Void
     var onReconcile: () -> Void
@@ -160,11 +164,23 @@ struct MenuView: View {
 
             Toggle("拖拽吸附屏幕边缘", isOn: Binding(
                 get: { store.config.snapEnabled },
-                set: { value in store.update { $0.snapEnabled = value } }))
+                set: { value in
+                    store.update { $0.snapEnabled = value }
+                    onPositionChange()
+                }))
+                .help("吸附区为屏幕宽 10% / 高 15%（与网页版一致的默认值）")
 
             Toggle("贴左镜像翻转", isOn: Binding(
                 get: { store.config.mirrorOnLeftSnap },
-                set: { value in store.update { $0.mirrorOnLeftSnap = value } }))
+                set: { value in
+                    store.update { $0.mirrorOnLeftSnap = value }
+                    onPositionChange()
+                }))
+                .help("挂件在屏幕左半边（或贴左吸附）时左右翻转，朝向屏幕内侧")
+
+            Button("重置位置") { onResetPosition() }
+                .controlSize(.small)
+                .help("把挂件移回屏幕右下角默认位置")
 
             Toggle("隐藏菜单按钮", isOn: Binding(
                 get: { store.config.menuButtonHidden },

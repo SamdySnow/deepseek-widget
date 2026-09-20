@@ -213,8 +213,363 @@ enum RenderCheck {
             check("能渲染不透明度的两个档位", false)
         }
 
+        // 5) 贴左镜像：**只翻转朝向，不翻转内容**。
+        //
+        // 参考实现的语义（也是用户报过的 bug）：
+        //   `.dshwv-root.dshwv-left{transform:scaleX(-1)}`      ← 整机翻
+        //   `.dshwv-left .dshwv-text{transform:scaleX(-1)}`     ← 文字反翻回来
+        //   `.dshwv-left .dshwv-gif{transform:scaleX(-1)}`      ← 图片同理
+        // 小鲸鱼翻过去朝向屏幕内侧，但**文字与图片必须仍然正向可读**。
+        //
+        // 怎么验？**单独渲染气泡层**（不含小鲸鱼）—— 小鲸鱼自己也是深蓝色、
+        // 还有大片白色，任何在全图里找「文字」的判据都会把鲸鱼算进来
+        // （本轮先后试过白色包围盒 / 全图深蓝像素 / 差值法，都被它污染，
+        // 甚至量出过镜像前后完全相同的数值）。
+        //
+        // 隔离之后结论就非常干脆：
+        //   反翻的本质就是「把内容水平翻一次」，所以
+        //     BubbleLayer(mirrored: true)  必须等于
+        //     `BubbleLayer(mirrored: false)` 的水平翻转。
+        //   若哪天有人删掉反翻，两者会变得**完全相同** → 这条断言立刻变红。
+        let savedPage = bubble.config.first
+        bubble.close()
+        var probeVariant = BubbleVariant()
+        probeVariant.rows = [BubbleRow(modules: [
+            BubbleModule(kind: .text, text: "DSH-镜像验证"),
+        ])]
+        bubble.update { $0.first = BubblePage(name: "镜像测试", variants: [probeVariant]) }
+        bubble.handleTap(menuHidden: false)   // 出泡，否则气泡层渲染不出内容
+
+        let plainLayer = renderBubbleLayerOnly(store: store, bubble: bubble,
+                                              panelWidth: 450, mirrored: false)
+        let flippedLayer = renderBubbleLayerOnly(store: store, bubble: bubble,
+                                                panelWidth: 450, mirrored: true)
+        if let a = plainLayer, let b = flippedLayer {
+            write(a, to: "\(outputDir)/bubble-unmirrored.png")
+            write(b, to: "\(outputDir)/bubble-mirrored.png")
+
+            let differs = imageDifferenceRatio(a, b)
+            check("反翻确实起了作用（镜像与未镜像的气泡层不同）", differs > 0.02,
+                  String(format: "像素差异 %.1f%%（若为 0 说明反翻被删掉了）", differs * 100))
+
+            // 核心断言：镜像态下的**文字朝向**必须与未镜像一致（即仍然可读）。
+            //
+            // 判据用「位置无关的字形掩码」：把文字像素归一化到自身包围盒，
+            // 采样成 N×N 的布尔网格，再比较两个朝向的掩码：
+            //   同向  → 掩码相同（文字可读，只是位置变了）
+            //   翻反  → 掩码等于「镜像后的掩码」（文字被翻反，即用户报的 bug）
+            // 这样比较不受气泡整体挪位的影响，也不会被泡泡形状自身的翻转干扰。
+            if let mPlain = textGlyphMask(a), let mFlipped = textGlyphMask(b) {
+                let same = hamming(mPlain, mFlipped)
+                let flip = hamming(mPlain, mirrorMask(mFlipped))
+                check("镜像后文字朝向与未镜像一致（同向差异 < 翻反差异）", same < flip,
+                      String(format: "同向差异 %.1f%% vs 翻反差异 %.1f%%",
+                             same * 100, flip * 100))
+                check("镜像后文字确实可读（与未镜像字形高度吻合）", same < 0.15,
+                      String(format: "同向差异 %.1f%%", same * 100))
+            } else {
+                check("能提取文字字形掩码", false)
+            }
+        } else {
+            check("能单独渲染气泡层（含镜像态）", false)
+        }
+
+        // ★ 关键：上面那两条只验了「气泡层自身」，**验不到「文字相对泡泡是否居中」**——
+        // 因为两处镜像是在**不同的嵌套/顺序**下生效的，只有整块面板的复合结果
+        // 才暴露问题（曾经：气泡层单测全绿，实机上文字却偏了约 50px）。
+        // 所以这里必须渲染**整块面板**再量偏移。
+        //
+        // 判据用「相对偏移」而不是绝对值：一段文字自身的墨迹本来就不在字形盒中心，
+        // 但**同一个气泡形状下的相对偏移**应当与朝向无关。取「文字重心 − 气泡填充重心」，
+        // 两个朝向的结果应当几乎相同。
+        let panelPlain = render(store: store, bubble: bubble, side: 450)
+        let panelMirror: NSImage? = {
+            let saved = store.config.lastSide
+            store.update { $0.lastSide = "left" }
+            let img = render(store: store, bubble: bubble, side: 450)
+            store.update { $0.lastSide = saved }
+            return img
+        }()
+        if let pp = panelPlain, let pm = panelMirror {
+            write(pm, to: "\(outputDir)/panel-bubble-mirrored.png")
+            if let cPlain = textCentroidX(pp), let cMirror = textCentroidX(pm) {
+                // 文字应当落在**泡泡椭圆的中心**，而椭圆中心并不在面板正中 ——
+                // 它在气泡盒的 `textAreaCenterX`（0.4425，即 SVG 里的 454/1026）。
+                // 镜像后整块面板翻转，椭圆中心随之到 `1 - 0.4425 = 0.5575`。
+                // 所以「居中」的期望值本身是随朝向变的 —— 不能拿面板中线 0.5 当基准
+                // （拿 0.5 比会得出一个假的 52px 偏差，那其实只是泡泡自己挪了位置）。
+                let cx = BubbleLayer.textAreaCenterX
+                let expectPlain = cx
+                let expectMirror = 1 - cx
+                check("未镜像时文字落在泡泡中心",
+                      abs(cPlain - expectPlain) < 0.05,
+                      String(format: "重心 x=%.4f（期望 %.4f，偏 %.1fpx）",
+                             cPlain, expectPlain, (cPlain - expectPlain) * 450))
+                check("镜像后文字**仍然**落在泡泡中心（本轮修复的正是这条）",
+                      abs(cMirror - expectMirror) < 0.05,
+                      String(format: "重心 x=%.4f（期望 %.4f，偏 %.1fpx）",
+                             cMirror, expectMirror, (cMirror - expectMirror) * 450))
+                // 换算到「相对泡泡中心」的偏移，两个朝向应当一致
+                let relPlain = cPlain - expectPlain
+                let relMirror = cMirror - expectMirror
+                check("两个朝向的文字相对泡泡中心的偏移一致",
+                      abs(relPlain - relMirror) < 0.03,
+                      String(format: "未镜像 %+.4f vs 镜像 %+.4f", relPlain, relMirror))
+            } else {
+                check("能从整块面板量出文字重心", false)
+            }
+        } else {
+            check("能渲染整块面板（含镜像态）", false)
+        }
+        bubble.update { $0.first = savedPage }
+        bubble.close()
+
+        // 对照：小鲸鱼**必须**确实翻过去了（否则这次「修复」就成了把翻转整个去掉）。
+        // 用「角色图区域内不透明像素的重心」判断：鲸鱼左右不对称，镜像后重心换侧。
+        store.update { $0.mirrorOnLeftSnap = true }
+        store.update { $0.lastSide = "right" }
+        let whaleRight = render(store: store, bubble: bubble, side: 450)
+        store.update { $0.lastSide = "left" }
+        let whaleLeft = render(store: store, bubble: bubble, side: 450)
+        store.update { $0.lastSide = "right" }
+        if let wr = whaleRight, let wl = whaleLeft,
+           let cxR = whaleCentroidX(wr), let cxL = whaleCentroidX(wl) {
+            check("小鲸鱼确实被翻过去了（整机镜像仍然生效）",
+                  abs(cxR - cxL) > 0.05,
+                  String(format: "鲸鱼重心 x %.3f → %.3f", cxR, cxL))
+        } else {
+            check("能渲染整机镜像对照", false)
+        }
+
+        // 关掉「贴左镜像翻转」开关后，整机不应再翻转（鲸鱼重心不动）
+        store.update { $0.mirrorOnLeftSnap = false }
+        let noMirrorR = render(store: store, bubble: bubble, side: 450)
+        store.update { $0.lastSide = "left" }
+        let noMirrorL = render(store: store, bubble: bubble, side: 450)
+        store.update { $0.lastSide = "right"; $0.mirrorOnLeftSnap = true }
+        if let nr = noMirrorR, let nl = noMirrorL,
+           let cR = whaleCentroidX(nr), let cL = whaleCentroidX(nl) {
+            check("关掉开关后贴左也不翻转（鲸鱼重心不动）", abs(cR - cL) < 0.001,
+                  String(format: "重心 %.3f → %.3f", cR, cL))
+        } else {
+            check("能渲染「关掉镜像」对照", false)
+        }
+
         print(failures == 0 ? "\n渲染校验全部通过 ✅" : "\n有 \(failures) 项失败 ❌")
         return failures == 0 ? 0 : 1
+    }
+
+    /// 提取文字的「位置无关字形掩码」：先取深蓝文字像素的包围盒，
+    /// 再归一化采样成 `n×n` 布尔网格。
+    ///
+    /// 归一化到包围盒是关键 —— 镜像会把气泡整体挪到面板另一侧，
+    /// 直接比对绝对坐标会得到一大堆差异（那是位置差，不是朝向差）。
+    /// 归一化之后，同一段文字无论被摆在哪里，掩码都相同；
+    /// 而**被翻反**的文字，掩码会等于原掩码的镜像 —— 这正是要判别的差异。
+    private static func textGlyphMask(_ image: NSImage, n: Int = 24,
+                                      threshold: Double = 0.35) -> [[Bool]]? {
+        guard let rep = bitmap(image) else { return nil }
+        let w = rep.pixelsWide, h = rep.pixelsHigh
+
+        // ① 找深蓝文字像素的包围盒
+        var minX = w, maxX = -1, minY = h, maxY = -1
+        for y in 0..<h {
+            for x in 0..<w {
+                guard let c = rep.colorAt(x: x, y: y), c.alphaComponent > 0.5 else { continue }
+                let r = Int(c.redComponent * 255), g = Int(c.greenComponent * 255)
+                let bl = Int(c.blueComponent * 255)
+                guard bl > r + 18, bl > g + 14, bl > 70, r < 190 else { continue }
+                minX = min(minX, x); maxX = max(maxX, x)
+                minY = min(minY, y); maxY = max(maxY, y)
+            }
+        }
+        guard maxX > minX, maxY > minY else { return nil }
+        let bw = maxX - minX + 1, bh = maxY - minY + 1
+
+        // ② 归一化采样：每个格子看该区域是否以深蓝像素为主
+        var mask = [[Bool]](repeating: [Bool](repeating: false, count: n), count: n)
+        for gy in 0..<n {
+            for gx in 0..<n {
+                let x0 = minX + bw * gx / n, x1 = minX + max(x0 + 1, bw * (gx + 1) / n)
+                let y0 = minY + bh * gy / n, y1 = minY + max(y0 + 1, bh * (gy + 1) / n)
+                var ink = 0, cells = 0
+                for y in y0..<min(y1, h) {
+                    for x in x0..<min(x1, w) {
+                        cells += 1
+                        guard let c = rep.colorAt(x: x, y: y), c.alphaComponent > 0.5 else { continue }
+                        let r = Int(c.redComponent * 255), g = Int(c.greenComponent * 255)
+                        let bl = Int(c.blueComponent * 255)
+                        if bl > r + 18, bl > g + 14, bl > 70, r < 190 { ink += 1 }
+                    }
+                }
+                mask[gy][gx] = cells > 0 && Double(ink) / Double(cells) > threshold
+            }
+        }
+        return mask
+    }
+
+    /// 两个掩码的差异比例（0 = 完全相同）。
+    private static func hamming(_ a: [[Bool]], _ b: [[Bool]]) -> Double {
+        guard a.count == b.count, let cols = a.first?.count, cols == b.first?.count else { return 1 }
+        var diff = 0, total = 0
+        for y in 0..<a.count {
+            for x in 0..<cols {
+                total += 1
+                if a[y][x] != b[y][x] { diff += 1 }
+            }
+        }
+        return total > 0 ? Double(diff) / Double(total) : 1
+    }
+
+    /// 掩码的水平镜像（用于判定「文字是否被翻反」）。
+    private static func mirrorMask(_ a: [[Bool]]) -> [[Bool]] {
+        a.map { $0.reversed() }
+    }
+
+    /// 文字墨迹重心的归一化 x（**只在气泡上半部统计**）。
+    ///
+    /// 为什么要限制纵向范围：整块面板里**小鲸鱼也是深蓝**，
+    /// 不限制的话量到的其实是鲸鱼（本轮又踩了一次 —— 镜像前后得到 ±0.21
+    /// 这种「恰好反号」的数，正是"量到了跟随镜像一起翻的鲸鱼"的指纹）。
+    /// 气泡占 y ∈ [0, 0.682]，鲸鱼从 y = 0.4055 开始，所以取 `y < 0.40`
+    /// 这段既在气泡内、又完全避开鲸鱼；文字区本身在 y ∈ [0.04, 0.396]，也落在这里。
+    private static func textCentroidX(_ image: NSImage) -> Double? {
+        guard let rep = bitmap(image) else { return nil }
+        let w = rep.pixelsWide, h = rep.pixelsHigh
+        let yLimit = Int(Double(h) * 0.40)
+        var sum = 0.0, n = 0
+        for y in 0..<yLimit {
+            for x in 0..<w {
+                guard let c = rep.colorAt(x: x, y: y), c.alphaComponent > 0.5 else { continue }
+                let r = Int(c.redComponent * 255), g = Int(c.greenComponent * 255)
+                let bl = Int(c.blueComponent * 255)
+                guard bl > r + 18, bl > g + 14, bl > 70, r < 190 else { continue }
+                sum += Double(x) / Double(w)
+                n += 1
+            }
+        }
+        return n > 0 ? sum / Double(n) : nil
+    }
+
+    /// 单独渲染气泡层（**不含小鲸鱼与菜单按钮**），可选镜像态。
+    ///
+    /// 之所以要能渲染镜像态：验「文字有没有被反翻回来」时，
+    /// 只要有鲸鱼在画面里，任何「找文字像素」的判据都会被鲸鱼（也是深蓝 + 大片白）
+    /// 污染。隔离到只剩气泡层，结论就干净了。
+    private static func renderBubbleLayerOnly(store: WhaleStore, bubble: BubbleRuntime,
+                                             panelWidth: CGFloat,
+                                             mirrored: Bool) -> NSImage? {
+        guard bubble.isOpen else { return nil }
+        let unit = panelWidth / BubbleShape.viewBox.width
+        let view = BubbleLayer(store: store, bubble: bubble, unit: unit, mirrored: mirrored)
+            .frame(width: panelWidth,
+                   height: panelWidth * BubbleShape.viewBox.height / BubbleShape.viewBox.width)
+            .background(Color.clear)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 1
+        renderer.isOpaque = false
+        return renderer.nsImage
+    }
+
+    /// 两张图的差异像素占比（形状一致时应当很小）。
+    private static func imageDifferenceRatio(_ x: NSImage, _ y: NSImage) -> Double {
+        guard let a = bitmap(x), let b = bitmap(y),
+              a.pixelsWide == b.pixelsWide, a.pixelsHigh == b.pixelsHigh else { return 1 }
+        var diff = 0, total = 0
+        for yy in stride(from: 0, to: a.pixelsHigh, by: 2) {
+            for xx in stride(from: 0, to: a.pixelsWide, by: 2) {
+                guard let ca = a.colorAt(x: xx, y: yy), let cb = b.colorAt(x: xx, y: yy) else { continue }
+                total += 1
+                let d = abs(Double(ca.alphaComponent) - Double(cb.alphaComponent))
+                    + abs(Double(ca.redComponent) - Double(cb.redComponent))
+                    + abs(Double(ca.greenComponent) - Double(cb.greenComponent))
+                    + abs(Double(ca.blueComponent) - Double(cb.blueComponent))
+                if d > 0.15 { diff += 1 }
+            }
+        }
+        return total > 0 ? Double(diff) / Double(total) : 1
+    }
+
+    /// 角色图（小鲸鱼）区域内不透明像素的归一化重心 x。
+    ///
+    /// 为什么这么做：小鲸鱼本身既深蓝又有大片白色，任何「全图找深蓝像素」或
+    /// 「全图找白色包围盒」的判据都会把鲸鱼算进来（本轮先后踩了这两个坑，
+    /// 甚至得到过镜像前后**完全相同**的数值）。用**差值**就精确了：
+    /// 出泡与收泡两张图里鲸鱼完全一致，相减即把它消掉，只剩气泡像素。
+    ///
+    /// 两个都必须处理的细节：
+    /// 1. 相减的两张图**朝向必须相同** —— 否则鲸鱼没被消掉，差值会覆盖整块面板
+    ///    （最初把「镜像出泡」与「未镜像收泡」相减，量出 59 万像素的"气泡"）。
+    /// 2. 还要**排除泡泡自身的描边** —— 描边也是深蓝、且左右对称，
+    ///    会把文字的不对称度稀释到接近 0。按包围盒内缩 15% 即可避开描边带。
+    ///
+    /// - Returns: `asymmetry` = 文字包围盒内的 `(右半−左半)/总数`。
+    ///   水平翻转文字会使其变号，因此可用「是否变号」判定文字有没有被翻反。
+    private static func bubbleTextAsymmetry(open: NSImage,
+                                            closed: NSImage) -> (asymmetry: Double, total: Int)? {
+        guard let a = bitmap(open), let b = bitmap(closed),
+              a.pixelsWide == b.pixelsWide, a.pixelsHigh == b.pixelsHigh else { return nil }
+        let w = a.pixelsWide, h = a.pixelsHigh
+
+        // ① 差值定位气泡（鲸鱼被消掉）
+        var bubbleMinX = w, bubbleMaxX = 0, bubbleMinY = h, bubbleMaxY = 0
+        var bubblePixels = 0
+        for y in 0..<h {
+            for x in 0..<w {
+                guard let ca = a.colorAt(x: x, y: y), let cb = b.colorAt(x: x, y: y) else { continue }
+                let da = abs(Double(ca.alphaComponent) - Double(cb.alphaComponent))
+                let dr = abs(Double(ca.redComponent) - Double(cb.redComponent))
+                let dg = abs(Double(ca.greenComponent) - Double(cb.greenComponent))
+                let db = abs(Double(ca.blueComponent) - Double(cb.blueComponent))
+                guard da > 0.25 || dr > 0.15 || dg > 0.15 || db > 0.15 else { continue }
+                bubblePixels += 1
+                bubbleMinX = min(bubbleMinX, x); bubbleMaxX = max(bubbleMaxX, x)
+                bubbleMinY = min(bubbleMinY, y); bubbleMaxY = max(bubbleMaxY, y)
+            }
+        }
+        guard bubblePixels > 200 else { return nil }
+
+        // ② 内缩避开描边带（描边是深蓝且左右对称，留着会把信号稀释掉）
+        let insetX = Int(Double(bubbleMaxX - bubbleMinX) * 0.15)
+        let insetY = Int(Double(bubbleMaxY - bubbleMinY) * 0.15)
+        let innerMinX = bubbleMinX + insetX, innerMaxX = bubbleMaxX - insetX
+        let innerMinY = bubbleMinY + insetY, innerMaxY = bubbleMaxY - insetY
+        guard innerMaxX > innerMinX, innerMaxY > innerMinY else { return nil }
+        let midX = (innerMinX + innerMaxX) / 2
+
+        // ③ 只统计深蓝系文字像素
+        var left = 0, right = 0
+        for y in innerMinY...innerMaxY {
+            for x in innerMinX...innerMaxX {
+                guard let c = a.colorAt(x: x, y: y), c.alphaComponent > 0.5 else { continue }
+                let r = Int(c.redComponent * 255), g = Int(c.greenComponent * 255)
+                let bl = Int(c.blueComponent * 255)
+                guard bl > r + 18, bl > g + 14, bl > 70, r < 190 else { continue }
+                if x < midX { left += 1 } else { right += 1 }
+            }
+        }
+        let total = left + right
+        guard total > 50 else { return nil }
+        return (Double(right - left) / Double(total), total)
+    }
+
+    /// 角色图（小鲸鱼）区域内不透明像素的归一化重心 x。
+    /// 鲸鱼左右不对称，镜像后重心会明显换到另一侧 —— 用它证明整机确实翻了。
+    private static func whaleCentroidX(_ image: NSImage) -> Double? {
+        guard let rep = bitmap(image) else { return nil }
+        let w = rep.pixelsWide, h = rep.pixelsHigh
+        let r = Positioning.whaleRectNormalized
+        var sum = 0.0, n = 0
+        for y in stride(from: 0, to: h, by: 2) {
+            for x in stride(from: 0, to: w, by: 2) {
+                let nx = Double(x) / Double(w)
+                let ny = Double(y) / Double(h)
+                guard r.contains(CGPoint(x: nx, y: ny)) else { continue }
+                guard let c = rep.colorAt(x: x, y: y), c.alphaComponent > 0.5 else { continue }
+                sum += nx; n += 1
+            }
+        }
+        return n > 0 ? sum / Double(n) : nil
     }
 
     /// 菜单按钮所在矩形内的白色像素数（用于判定锁定角标是否画出来了）。

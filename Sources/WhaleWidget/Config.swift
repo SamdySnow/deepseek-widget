@@ -44,9 +44,15 @@ struct AppConfig: Codable {
     var snapMargin: Double = 24
     var lastX: Double?
     var lastY: Double?
-    /// 贴左吸附时水平镜像（文字同步反向）
+    /// 贴左时水平镜像：小鲸鱼翻过去朝向屏幕内侧，**文字与图片反翻回来保持可读**
+    /// （与参考实现的 `.dshwv-left .dshwv-text{scaleX(-1)}` 一致）。
     var mirrorOnLeftSnap: Bool = true
-    var lastSide: String = "right"      // left | right | none
+    /// 当前朝向：`left`（已翻转，朝屏幕右内）/ `right`（未翻转，朝屏幕左内）。
+    ///
+    /// 由 `PanelController.refreshMirror()` **按几何实时推导**并写入，
+    /// 不是用户手动设置的开关 —— 所以只会有 left / right 两个值
+    /// （早期版本还写过 `none`，那种「不知道朝哪」的状态已不再出现）。
+    var lastSide: String = "right"      // left | right
 
     // 监听间隔（秒）
     var refreshInterval: Double = 60

@@ -17,6 +17,14 @@ struct WhalePanelView: View {
 
     @State private var menuHover = false
 
+    /// 翻转动画时长。与参考实现的 `transition: transform .3s ease` 同口径。
+    static let flipDuration: TimeInterval = 0.3
+
+    /// 当前是否处于镜像（贴左 + 开关打开）。
+    private var mirrored: Bool {
+        store.config.lastSide == "left" && store.config.mirrorOnLeftSnap
+    }
+
     var body: some View {
         GeometryReader { geo in
             let width = geo.size.width
@@ -54,10 +62,16 @@ struct WhalePanelView: View {
             .opacity(store.config.panelOpacity)
         }
         .frame(width: panelSide, height: panelSide)
-        // 贴左吸附时整体水平镜像（文字同步反向）
-        .scaleEffect(x: store.config.lastSide == "left" && store.config.mirrorOnLeftSnap ? -1 : 1,
-                     y: 1, anchor: .center)
-        .animation(.easeInOut(duration: 0.3), value: store.config.lastSide)
+        // 贴左时整体水平镜像：小鲸鱼翻过去朝向屏幕内侧。
+        //
+        // **只镜像整机** —— 气泡里的文字与图片在 `BubbleLayer` 内反向再翻一次，
+        // 与参考实现一致：
+        //   `.dshwv-root.dshwv-left{transform:scaleX(-1)}`
+        //   `.dshwv-left .dshwv-text{transform:scaleX(-1)}`
+        //   `.dshwv-left .dshwv-gif{transform:scaleX(-1)}`
+        // 即「翻转朝向，但不翻转内容」—— 若省掉那次反翻转，文字会是反的。
+        .scaleEffect(x: mirrored ? -1 : 1, y: 1, anchor: .center)
+        .animation(.easeInOut(duration: Self.flipDuration), value: mirrored)
         .animation(.easeInOut(duration: 0.12), value: store.config.panelOpacity)
     }
 
@@ -96,7 +110,8 @@ struct WhalePanelView: View {
             Color.clear
 
             if bubble.isOpen {
-                BubbleLayer(store: store, bubble: bubble, unit: unit)
+                // 传入 mirrored：气泡内容层会把自己**反向再翻一次**（见 BubbleLayer）
+                BubbleLayer(store: store, bubble: bubble, unit: unit, mirrored: mirrored)
                     .frame(width: bubbleRect(width: width).width,
                            height: bubbleRect(width: width).height)
                     .transition(.opacity)
@@ -163,6 +178,13 @@ struct BubbleLayer: View {
     @ObservedObject var store: WhaleStore
     @ObservedObject var bubble: BubbleRuntime
     let unit: CGFloat
+    /// 面板是否处于镜像。
+    ///
+    /// 整机镜像会把文字一起翻成反的，所以内容层要**反向再翻一次**抵消掉
+    /// （参考实现的 `.dshwv-left .dshwv-text{transform:scaleX(-1)}`）。
+    /// 图片同理：`gif` 也要反翻，否则宠物图会左右颠倒。
+    /// 注意这里反翻的是**内容**，泡泡的外形仍跟随整机镜像（与参考实现相同）。
+    var mirrored: Bool = false
 
     private var page: BubblePage? { bubble.currentPage }
 
@@ -202,6 +224,22 @@ struct BubbleLayer: View {
                 }
                 .frame(width: BubbleShape.viewBox.width * unit * Self.textAreaWidthRatio,
                        height: BubbleShape.viewBox.height * unit * Self.textAreaHeightRatio)
+                // 反向镜像：把内容翻回来抵消整机那次翻转，文字 / 图片保持正向可读。
+                //
+                // **必须挂在 `.position` 之前**。`scaleEffect` 是绕「自身 frame 的中心」
+                // 翻转的：挂到 `.position` 之后时，frame 已被撑满整层、其中心正好等于
+                // 整机镜像的中心 —— 两次镜像**同轴**，净效果是内容被原样翻回、留在
+                // 未镜像的位置，而泡泡外形却翻到了镜像后的位置 → 文字相对泡泡偏掉
+                // （实测约 50px，用户看到的就是「翻转后文字不居中」）。
+                //
+                // 挂在前面才是正确的复合顺序：
+                //   ① 先绕内容自身中心翻一次（朝向变，仍待在自己 frame 的中间）
+                //   ② 再由 `.position` 摆到（未镜像的）目标位置
+                //   ③ 最后整机翻转把 frame 与内容一起搬到镜像后的位置
+                // 净效果：位置跟着镜像走、朝向被翻回来 —— 这才是参考实现
+                // `.dshwv-left .dshwv-text{transform:translate(-50%,-50%) scaleX(-1)}` 的语义。
+                .scaleEffect(x: mirrored ? -1 : 1, y: 1, anchor: .center)
+                .animation(.easeInOut(duration: WhalePanelView.flipDuration), value: mirrored)
                 .position(x: BubbleShape.viewBox.width * unit * Self.textAreaCenterX,
                           y: BubbleShape.viewBox.height * unit * Self.textAreaCenterY)
             }

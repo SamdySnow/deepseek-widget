@@ -135,6 +135,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.panel?.applyScale()
         }, onInteractionChange: { [weak self] in
             self?.panel?.applyInteractionState()
+        }, onPositionChange: { [weak self] in
+            self?.panel?.applyPositionSettings()
+        }, onResetPosition: { [weak self] in
+            self?.panel?.resetPosition()
         }))
         let size = NSSize(width: 380, height: 520)
         hosting.frame = NSRect(origin: .zero, size: size)
@@ -159,6 +163,8 @@ struct SettingsView: View {
     @ObservedObject var bubble: BubbleRuntime
     var onScaleChange: () -> Void
     var onInteractionChange: () -> Void
+    var onPositionChange: () -> Void
+    var onResetPosition: () -> Void
 
     var body: some View {
         ScrollView {
@@ -167,6 +173,8 @@ struct SettingsView: View {
                      soundPlayer: SoundPlayer(),
                      onScaleChange: onScaleChange,
                      onInteractionChange: onInteractionChange,
+                     onPositionChange: onPositionChange,
+                     onResetPosition: onResetPosition,
                      onOpenUsage: {
                          WindowPresenter.shared.show(title: "用量记录",
                                                      size: NSSize(width: 460, height: 560)) {

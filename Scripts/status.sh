@@ -51,4 +51,8 @@ c = json.loads(p.read_text())
 print("locked:", c.get("locked", False), "（True 时挂件不响应鼠标，需从菜单栏 🐋 解锁）")
 print("opacity:", c.get("opacity", 1.0), "（缺失 = 1.0）")
 print("snapEnabled:", c.get("snapEnabled", True))
+# 位置与朝向：lastSide 由几何推导（left = 已翻转），
+# 排查「拖到边上没吸附 / 没翻转」时先看这三个值是否自洽。
+print("position: x=%s y=%s lastSide=%s" % (
+    c.get("lastX"), c.get("lastY"), c.get("lastSide")))
 PY

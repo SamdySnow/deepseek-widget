@@ -239,22 +239,52 @@ enum SelfTest {
               "(\(Int(tiny.x)), \(Int(tiny.y)))")
 
         let corner = Positioning.snapped(origin: CGPoint(x: 1274, y: 5), side: side,
-                                         visible: visible, margin: 24)
+                                         visible: visible, zones: .uniform(24))
         check("贴右下时吸附到右边与底边",
               corner.side == "right" && corner.origin.x == visible.maxX - side && corner.origin.y == 0,
               "edge=\(corner.side) origin=(\(Int(corner.origin.x)), \(Int(corner.origin.y)))")
 
         let leftCorner = Positioning.snapped(origin: CGPoint(x: 8, y: 630), side: side,
-                                             visible: visible, margin: 24)
+                                             visible: visible, zones: .uniform(24))
         check("贴左上时吸附并标记 left（供镜像翻转）",
               leftCorner.side == "left" && leftCorner.origin.x == 0,
               "edge=\(leftCorner.side)")
 
         let middle = Positioning.snapped(origin: CGPoint(x: 700, y: 400), side: side,
-                                         visible: visible, margin: 24)
+                                         visible: visible, zones: .uniform(24))
         check("屏幕中间不吸附", middle.side == "none",
               "edge=\(middle.side)")
 
+        // 参考实现的默认吸附区（左右 10%、下 15%、上 0）—— 比固定 24px 宽得多，
+        // 这正是「吸附不生效」的根因：原先只有参考实现宽度的 ~14%。
+        let refZones = Positioning.Zones.reference(for: visible)
+        check("左右吸附区按屏幕宽 10% 计算（远宽于旧的固定 24px）",
+              abs(refZones.left - visible.width * 0.10) < 1,
+              String(format: "左 %.0fpx（旧版固定 24px）", refZones.left))
+        check("底边吸附区按屏幕高 15% 计算",
+              abs(refZones.bottom - visible.height * 0.15) < 1,
+              String(format: "下 %.0fpx", refZones.bottom))
+        check("上边不吸附（跟随参考实现 T=0）", refZones.top == 0,
+              "上 \(Int(refZones.top))px")
+
+        // 关键回归：在旧的固定 24px 判据下「不吸附」的位置，按新判据应当吸附。
+        // 这是用户感知「吸附不生效」的直接复现。
+        let justInside = CGPoint(x: visible.minX + 100, y: visible.midY)
+        let oldResult = Positioning.snapped(origin: justInside, side: side,
+                                            visible: visible, zones: .uniform(24))
+        let newResult = Positioning.snapped(origin: justInside, side: side,
+                                            visible: visible, zones: refZones)
+        check("距左边 100px：旧判据不吸附、新判据吸附（复现用户反馈）",
+              oldResult.side == "none" && newResult.side == "left",
+              "旧=\(oldResult.side) 新=\(newResult.side)")
+
+        // 上边不吸附：靠近顶部时应当保持原位（不会被吸到顶）
+        let nearTopPos = CGPoint(x: visible.midX, y: visible.maxY - side - 50)
+        let topResult = Positioning.snapped(origin: nearTopPos, side: side,
+                                            visible: visible, zones: refZones)
+        check("靠近屏幕顶部不吸附（上边吸附区为 0）",
+              topResult.origin.y == nearTopPos.y,
+              "y=\(Int(topResult.origin.y))")
         let fallback = Positioning.defaultOrigin(side: side, visible: visible, margin: 24)
         check("默认位置为右下角且完整可见",
               Positioning.isFullyVisible(origin: fallback, side: side, visible: visible)
